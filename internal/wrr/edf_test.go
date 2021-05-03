@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-func (s) TestEDFOnEndpointsWithSameWeight(t *testing.T) {
+func TestEDFOnEndpointsWithSameWeight(t *testing.T) {
 	wrr := NewEDF()
 	wrr.Add("1", 1)
 	wrr.Add("2", 1)
