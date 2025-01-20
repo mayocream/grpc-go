@@ -25,10 +25,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
+	rand "math/rand/v2"
 	"net"
 	"os"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -52,7 +51,7 @@ type server struct {
 }
 
 // SayHello implements helloworld.GreeterServer interface.
-func (s *server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
+func (s *server) SayHello(_ context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
 	log.Printf("Received: %v", in.GetName())
 	return &pb.HelloReply{Message: "Hello " + in.GetName() + ", from " + s.serverName}, nil
 }
@@ -61,7 +60,6 @@ func determineHostname() string {
 	hostname, err := os.Hostname()
 	if err != nil {
 		log.Printf("Failed to get hostname: %v, will generate one", err)
-		rand.Seed(time.Now().UnixNano())
 		return fmt.Sprintf("generated-%03d", rand.Int()%100)
 	}
 	return hostname
@@ -85,7 +83,10 @@ func main() {
 		}
 	}
 
-	greeterServer := xds.NewGRPCServer(grpc.Creds(creds))
+	greeterServer, err := xds.NewGRPCServer(grpc.Creds(creds))
+	if err != nil {
+		log.Fatalf("Failed to create an xDS enabled gRPC server: %v", err)
+	}
 	pb.RegisterGreeterServer(greeterServer, &server{serverName: determineHostname()})
 
 	healthPort := fmt.Sprintf(":%d", *port+1)

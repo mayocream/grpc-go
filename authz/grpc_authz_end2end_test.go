@@ -23,7 +23,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"io"
-	"net"
 	"os"
 	"testing"
 	"time"
@@ -34,31 +33,14 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/grpctest"
+	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	pb "google.golang.org/grpc/test/grpc_testing"
 	"google.golang.org/grpc/testdata"
+
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
-
-type testServer struct {
-	pb.UnimplementedTestServiceServer
-}
-
-func (s *testServer) UnaryCall(ctx context.Context, req *pb.SimpleRequest) (*pb.SimpleResponse, error) {
-	return &pb.SimpleResponse{}, nil
-}
-
-func (s *testServer) StreamingInputCall(stream pb.TestService_StreamingInputCallServer) error {
-	for {
-		_, err := stream.Recv()
-		if err == io.EOF {
-			return stream.SendAndClose(&pb.StreamingInputCallResponse{})
-		}
-		if err != nil {
-			return err
-		}
-	}
-}
 
 type s struct {
 	grpctest.Tester
@@ -76,7 +58,7 @@ var authzTests = map[string]struct {
 	"DeniesRPCMatchInDenyNoMatchInAllow": {
 		authzPolicy: `{
 				"name": "authz",
-				"allow_rules": 
+				"allow_rules":
 				[
 					{
 						"name": "allow_StreamingOutputCall",
@@ -164,11 +146,11 @@ var authzTests = map[string]struct {
 								"/grpc.testing.TestService/UnaryCall",
 								"/grpc.testing.TestService/StreamingInputCall"
 							],
-							"headers": 
+							"headers":
 							[
 								{
 									"key": "key-abc",
-									"values": 
+									"values":
 									[
 										"val-abc",
 										"val-def"
@@ -248,7 +230,7 @@ var authzTests = map[string]struct {
 				[
 					{
 						"name": "allow_StreamingOutputCall",
-						"request": 
+						"request":
 						{
 							"paths":
 							[
@@ -311,32 +293,41 @@ func (s) TestStaticPolicyEnd2End(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// Start a gRPC server with gRPC authz unary and stream server interceptors.
 			i, _ := authz.NewStatic(test.authzPolicy)
-			s := grpc.NewServer(
-				grpc.ChainUnaryInterceptor(i.UnaryInterceptor),
-				grpc.ChainStreamInterceptor(i.StreamInterceptor))
-			defer s.Stop()
-			pb.RegisterTestServiceServer(s, &testServer{})
 
-			lis, err := net.Listen("tcp", "localhost:0")
-			if err != nil {
-				t.Fatalf("error listening: %v", err)
+			stub := &stubserver.StubServer{
+				UnaryCallF: func(ctx context.Context, req *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+					return &testpb.SimpleResponse{}, nil
+				},
+				StreamingInputCallF: func(stream testgrpc.TestService_StreamingInputCallServer) error {
+					for {
+						_, err := stream.Recv()
+						if err == io.EOF {
+							return stream.SendAndClose(&testpb.StreamingInputCallResponse{})
+						}
+						if err != nil {
+							return err
+						}
+					}
+				},
+				S: grpc.NewServer(grpc.ChainUnaryInterceptor(i.UnaryInterceptor), grpc.ChainStreamInterceptor(i.StreamInterceptor)),
 			}
-			go s.Serve(lis)
+			stubserver.StartTestService(t, stub)
+			defer stub.Stop()
 
 			// Establish a connection to the server.
-			clientConn, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			cc, err := grpc.NewClient(stub.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
-				t.Fatalf("grpc.Dial(%v) failed: %v", lis.Addr().String(), err)
+				t.Fatalf("grpc.NewClient(%v) failed: %v", stub.Address, err)
 			}
-			defer clientConn.Close()
-			client := pb.NewTestServiceClient(clientConn)
+			defer cc.Close()
+			client := testgrpc.NewTestServiceClient(cc)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			ctx = metadata.NewOutgoingContext(ctx, test.md)
 
 			// Verifying authorization decision for Unary RPC.
-			_, err = client.UnaryCall(ctx, &pb.SimpleRequest{})
+			_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
 			if got := status.Convert(err); got.Code() != test.wantStatus.Code() || got.Message() != test.wantStatus.Message() {
 				t.Fatalf("[UnaryCall] error want:{%v} got:{%v}", test.wantStatus.Err(), got.Err())
 			}
@@ -346,8 +337,8 @@ func (s) TestStaticPolicyEnd2End(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed StreamingInputCall err: %v", err)
 			}
-			req := &pb.StreamingInputCallRequest{
-				Payload: &pb.Payload{
+			req := &testpb.StreamingInputCallRequest{
+				Payload: &testpb.Payload{
 					Body: []byte("hi"),
 				},
 			}
@@ -381,35 +372,33 @@ func (s) TestAllowsRPCRequestWithPrincipalsFieldOnTLSAuthenticatedConnection(t *
 	if err != nil {
 		t.Fatalf("failed to generate credentials: %v", err)
 	}
-	s := grpc.NewServer(
-		grpc.Creds(creds),
-		grpc.ChainUnaryInterceptor(i.UnaryInterceptor))
-	defer s.Stop()
-	pb.RegisterTestServiceServer(s, &testServer{})
 
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatalf("error listening: %v", err)
+	stub := &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, req *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
+		},
+		S: grpc.NewServer(grpc.Creds(creds), grpc.ChainUnaryInterceptor(i.UnaryInterceptor)),
 	}
-	go s.Serve(lis)
+	stubserver.StartTestService(t, stub)
+	defer stub.S.Stop()
 
 	// Establish a connection to the server.
 	creds, err = credentials.NewClientTLSFromFile(testdata.Path("x509/server_ca_cert.pem"), "x.test.example.com")
 	if err != nil {
 		t.Fatalf("failed to load credentials: %v", err)
 	}
-	clientConn, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(creds))
+	cc, err := grpc.NewClient(stub.Address, grpc.WithTransportCredentials(creds))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%v) failed: %v", lis.Addr().String(), err)
+		t.Fatalf("grpc.NewClient(%v) failed: %v", stub.Address, err)
 	}
-	defer clientConn.Close()
-	client := pb.NewTestServiceClient(clientConn)
+	defer cc.Close()
+	client := testgrpc.NewTestServiceClient(cc)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Verifying authorization decision.
-	if _, err = client.UnaryCall(ctx, &pb.SimpleRequest{}); err != nil {
+	if _, err = client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
 		t.Fatalf("client.UnaryCall(_, _) = %v; want nil", err)
 	}
 }
@@ -446,17 +435,14 @@ func (s) TestAllowsRPCRequestWithPrincipalsFieldOnMTLSAuthenticatedConnection(t 
 		Certificates: []tls.Certificate{cert},
 		ClientCAs:    certPool,
 	})
-	s := grpc.NewServer(
-		grpc.Creds(creds),
-		grpc.ChainUnaryInterceptor(i.UnaryInterceptor))
-	defer s.Stop()
-	pb.RegisterTestServiceServer(s, &testServer{})
-
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatalf("error listening: %v", err)
+	stub := &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, req *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
+		},
+		S: grpc.NewServer(grpc.Creds(creds), grpc.ChainUnaryInterceptor(i.UnaryInterceptor)),
 	}
-	go s.Serve(lis)
+	stubserver.StartTestService(t, stub)
+	defer stub.Stop()
 
 	// Establish a connection to the server.
 	cert, err = tls.LoadX509KeyPair(testdata.Path("x509/client1_cert.pem"), testdata.Path("x509/client1_key.pem"))
@@ -476,18 +462,18 @@ func (s) TestAllowsRPCRequestWithPrincipalsFieldOnMTLSAuthenticatedConnection(t 
 		RootCAs:      roots,
 		ServerName:   "x.test.example.com",
 	})
-	clientConn, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(creds))
+	cc, err := grpc.NewClient(stub.Address, grpc.WithTransportCredentials(creds))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%v) failed: %v", lis.Addr().String(), err)
+		t.Fatalf("grpc.NewClient(%v) failed: %v", stub.Address, err)
 	}
-	defer clientConn.Close()
-	client := pb.NewTestServiceClient(clientConn)
+	defer cc.Close()
+	client := testgrpc.NewTestServiceClient(cc)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Verifying authorization decision.
-	if _, err = client.UnaryCall(ctx, &pb.SimpleRequest{}); err != nil {
+	if _, err = client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
 		t.Fatalf("client.UnaryCall(_, _) = %v; want nil", err)
 	}
 }
@@ -499,34 +485,41 @@ func (s) TestFileWatcherEnd2End(t *testing.T) {
 			i, _ := authz.NewFileWatcher(file, 1*time.Second)
 			defer i.Close()
 
-			// Start a gRPC server with gRPC authz unary and stream server interceptors.
-			s := grpc.NewServer(
-				grpc.ChainUnaryInterceptor(i.UnaryInterceptor),
-				grpc.ChainStreamInterceptor(i.StreamInterceptor))
-			defer s.Stop()
-			pb.RegisterTestServiceServer(s, &testServer{})
-
-			lis, err := net.Listen("tcp", "localhost:0")
-			if err != nil {
-				t.Fatalf("error listening: %v", err)
+			stub := &stubserver.StubServer{
+				UnaryCallF: func(ctx context.Context, req *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+					return &testpb.SimpleResponse{}, nil
+				},
+				StreamingInputCallF: func(stream testgrpc.TestService_StreamingInputCallServer) error {
+					for {
+						_, err := stream.Recv()
+						if err == io.EOF {
+							return stream.SendAndClose(&testpb.StreamingInputCallResponse{})
+						}
+						if err != nil {
+							return err
+						}
+					}
+				},
+				// Start a gRPC server with gRPC authz unary and stream server interceptors.
+				S: grpc.NewServer(grpc.ChainUnaryInterceptor(i.UnaryInterceptor), grpc.ChainStreamInterceptor(i.StreamInterceptor)),
 			}
-			defer lis.Close()
-			go s.Serve(lis)
+			stubserver.StartTestService(t, stub)
+			defer stub.Stop()
 
 			// Establish a connection to the server.
-			clientConn, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			cc, err := grpc.NewClient(stub.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
-				t.Fatalf("grpc.Dial(%v) failed: %v", lis.Addr().String(), err)
+				t.Fatalf("grpc.NewClient(%v) failed: %v", stub.Address, err)
 			}
-			defer clientConn.Close()
-			client := pb.NewTestServiceClient(clientConn)
+			defer cc.Close()
+			client := testgrpc.NewTestServiceClient(cc)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			ctx = metadata.NewOutgoingContext(ctx, test.md)
 
 			// Verifying authorization decision for Unary RPC.
-			_, err = client.UnaryCall(ctx, &pb.SimpleRequest{})
+			_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
 			if got := status.Convert(err); got.Code() != test.wantStatus.Code() || got.Message() != test.wantStatus.Message() {
 				t.Fatalf("[UnaryCall] error want:{%v} got:{%v}", test.wantStatus.Err(), got.Err())
 			}
@@ -534,15 +527,15 @@ func (s) TestFileWatcherEnd2End(t *testing.T) {
 			// Verifying authorization decision for Streaming RPC.
 			stream, err := client.StreamingInputCall(ctx)
 			if err != nil {
-				t.Fatalf("failed StreamingInputCall err: %v", err)
+				t.Fatalf("failed StreamingInputCall : %v", err)
 			}
-			req := &pb.StreamingInputCallRequest{
-				Payload: &pb.Payload{
+			req := &testpb.StreamingInputCallRequest{
+				Payload: &testpb.Payload{
 					Body: []byte("hi"),
 				},
 			}
 			if err := stream.Send(req); err != nil && err != io.EOF {
-				t.Fatalf("failed stream.Send err: %v", err)
+				t.Fatalf("failed stream.Send : %v", err)
 			}
 			_, err = stream.CloseAndRecv()
 			if got := status.Convert(err); got.Code() != test.wantStatus.Code() || got.Message() != test.wantStatus.Message() {
@@ -552,9 +545,9 @@ func (s) TestFileWatcherEnd2End(t *testing.T) {
 	}
 }
 
-func retryUntil(ctx context.Context, tsc pb.TestServiceClient, want *status.Status) (lastErr error) {
+func retryUntil(ctx context.Context, tsc testgrpc.TestServiceClient, want *status.Status) (lastErr error) {
 	for ctx.Err() == nil {
-		_, lastErr = tsc.UnaryCall(ctx, &pb.SimpleRequest{})
+		_, lastErr = tsc.UnaryCall(ctx, &testpb.SimpleRequest{})
 		if s := status.Convert(lastErr); s.Code() == want.Code() && s.Message() == want.Message() {
 			return nil
 		}
@@ -569,32 +562,29 @@ func (s) TestFileWatcher_ValidPolicyRefresh(t *testing.T) {
 	i, _ := authz.NewFileWatcher(file, 100*time.Millisecond)
 	defer i.Close()
 
-	// Start a gRPC server with gRPC authz unary server interceptor.
-	s := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(i.UnaryInterceptor))
-	defer s.Stop()
-	pb.RegisterTestServiceServer(s, &testServer{})
-
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatalf("error listening: %v", err)
+	stub := &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, req *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
+		},
+		// Start a gRPC server with gRPC authz unary server interceptor.
+		S: grpc.NewServer(grpc.ChainUnaryInterceptor(i.UnaryInterceptor)),
 	}
-	defer lis.Close()
-	go s.Serve(lis)
+	stubserver.StartTestService(t, stub)
+	defer stub.Stop()
 
 	// Establish a connection to the server.
-	clientConn, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(stub.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%v) failed: %v", lis.Addr().String(), err)
+		t.Fatalf("grpc.NewClient(%v) failed: %v", stub.Address, err)
 	}
-	defer clientConn.Close()
-	client := pb.NewTestServiceClient(clientConn)
+	defer cc.Close()
+	client := testgrpc.NewTestServiceClient(cc)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Verifying authorization decision.
-	_, err = client.UnaryCall(ctx, &pb.SimpleRequest{})
+	_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
 	if got := status.Convert(err); got.Code() != valid1.wantStatus.Code() || got.Message() != valid1.wantStatus.Message() {
 		t.Fatalf("client.UnaryCall(_, _) = %v; want = %v", got.Err(), valid1.wantStatus.Err())
 	}
@@ -617,32 +607,29 @@ func (s) TestFileWatcher_InvalidPolicySkipReload(t *testing.T) {
 	i, _ := authz.NewFileWatcher(file, 20*time.Millisecond)
 	defer i.Close()
 
-	// Start a gRPC server with gRPC authz unary server interceptors.
-	s := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(i.UnaryInterceptor))
-	defer s.Stop()
-	pb.RegisterTestServiceServer(s, &testServer{})
-
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatalf("error listening: %v", err)
+	stub := &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, req *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
+		},
+		// Start a gRPC server with gRPC authz unary server interceptors.
+		S: grpc.NewServer(grpc.ChainUnaryInterceptor(i.UnaryInterceptor)),
 	}
-	defer lis.Close()
-	go s.Serve(lis)
+	stubserver.StartTestService(t, stub)
+	defer stub.Stop()
 
 	// Establish a connection to the server.
-	clientConn, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(stub.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%v) failed: %v", lis.Addr().String(), err)
+		t.Fatalf("grpc.NewClient(%v) failed: %v", stub.Address, err)
 	}
-	defer clientConn.Close()
-	client := pb.NewTestServiceClient(clientConn)
+	defer cc.Close()
+	client := testgrpc.NewTestServiceClient(cc)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Verifying authorization decision.
-	_, err = client.UnaryCall(ctx, &pb.SimpleRequest{})
+	_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
 	if got := status.Convert(err); got.Code() != valid.wantStatus.Code() || got.Message() != valid.wantStatus.Message() {
 		t.Fatalf("client.UnaryCall(_, _) = %v; want = %v", got.Err(), valid.wantStatus.Err())
 	}
@@ -656,7 +643,7 @@ func (s) TestFileWatcher_InvalidPolicySkipReload(t *testing.T) {
 	time.Sleep(40 * time.Millisecond)
 
 	// Verifying authorization decision.
-	_, err = client.UnaryCall(ctx, &pb.SimpleRequest{})
+	_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
 	if got := status.Convert(err); got.Code() != valid.wantStatus.Code() || got.Message() != valid.wantStatus.Message() {
 		t.Fatalf("client.UnaryCall(_, _) = %v; want = %v", got.Err(), valid.wantStatus.Err())
 	}
@@ -668,32 +655,28 @@ func (s) TestFileWatcher_RecoversFromReloadFailure(t *testing.T) {
 	i, _ := authz.NewFileWatcher(file, 100*time.Millisecond)
 	defer i.Close()
 
-	// Start a gRPC server with gRPC authz unary server interceptors.
-	s := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(i.UnaryInterceptor))
-	defer s.Stop()
-	pb.RegisterTestServiceServer(s, &testServer{})
-
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatalf("error listening: %v", err)
+	stub := &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, req *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
+		},
+		S: grpc.NewServer(grpc.ChainUnaryInterceptor(i.UnaryInterceptor)),
 	}
-	defer lis.Close()
-	go s.Serve(lis)
+	stubserver.StartTestService(t, stub)
+	defer stub.Stop()
 
 	// Establish a connection to the server.
-	clientConn, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(stub.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%v) failed: %v", lis.Addr().String(), err)
+		t.Fatalf("grpc.NewClient(%v) failed: %v", stub.Address, err)
 	}
-	defer clientConn.Close()
-	client := pb.NewTestServiceClient(clientConn)
+	defer cc.Close()
+	client := testgrpc.NewTestServiceClient(cc)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Verifying authorization decision.
-	_, err = client.UnaryCall(ctx, &pb.SimpleRequest{})
+	_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
 	if got := status.Convert(err); got.Code() != valid1.wantStatus.Code() || got.Message() != valid1.wantStatus.Message() {
 		t.Fatalf("client.UnaryCall(_, _) = %v; want = %v", got.Err(), valid1.wantStatus.Err())
 	}
@@ -707,7 +690,7 @@ func (s) TestFileWatcher_RecoversFromReloadFailure(t *testing.T) {
 	time.Sleep(120 * time.Millisecond)
 
 	// Verifying authorization decision.
-	_, err = client.UnaryCall(ctx, &pb.SimpleRequest{})
+	_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
 	if got := status.Convert(err); got.Code() != valid1.wantStatus.Code() || got.Message() != valid1.wantStatus.Message() {
 		t.Fatalf("client.UnaryCall(_, _) = %v; want = %v", got.Err(), valid1.wantStatus.Err())
 	}

@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/internal"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
@@ -58,11 +59,16 @@ type metricsInfo struct {
 	sentMsgs int64
 	// number of bytes sent (within each message) from side (client || server)
 	sentBytes int64
+	// number of bytes after compression (within each message) from side (client || server)
+	sentCompressedBytes int64
 	// number of messages received on side (client || server)
 	recvMsgs int64
 	// number of bytes received (within each message) received on side (client
 	// || server)
 	recvBytes int64
+	// number of compressed bytes received (within each message) received on
+	// side (client || server)
+	recvCompressedBytes int64
 
 	startTime time.Time
 	method    string
@@ -81,7 +87,7 @@ func (csh *clientStatsHandler) statsTagRPC(ctx context.Context, info *stats.RPCT
 
 	// Populate gRPC Metadata with OpenCensus tag map if set by application.
 	if tm := tag.FromContext(ctx); tm != nil {
-		ctx = stats.SetTags(ctx, tag.Encode(tm))
+		ctx = metadata.AppendToOutgoingContext(ctx, "grpc-tags-bin", string(tag.Encode(tm)))
 	}
 	return ctx, mi
 }
@@ -89,18 +95,21 @@ func (csh *clientStatsHandler) statsTagRPC(ctx context.Context, info *stats.RPCT
 // statsTagRPC creates a recording object to derive measurements from in the
 // context, scoping the recordings to per RPC server side (scope of the
 // context). It also deserializes the opencensus tags set in the context's gRPC
-// Metadata, and adds a server method tag to the opencensus tags.
+// Metadata, and adds a server method tag to the opencensus tags. If multiple
+// tags exist, it adds the last one.
 func (ssh *serverStatsHandler) statsTagRPC(ctx context.Context, info *stats.RPCTagInfo) (context.Context, *metricsInfo) {
 	mi := &metricsInfo{
 		startTime: time.Now(),
 		method:    info.FullMethodName,
 	}
 
-	if tagsBin := stats.Tags(ctx); tagsBin != nil {
+	if tgValues := metadata.ValueFromIncomingContext(ctx, "grpc-tags-bin"); len(tgValues) > 0 {
+		tagsBin := []byte(tgValues[len(tgValues)-1])
 		if tags, err := tag.Decode(tagsBin); err == nil {
 			ctx = tag.NewContext(ctx, tags)
 		}
 	}
+
 	// We can ignore the error here because in the error case, the context
 	// passed in is returned. If the call errors, the server side application
 	// layer won't get this key server method information in the tag map, but
@@ -117,9 +126,9 @@ func recordRPCData(ctx context.Context, s stats.RPCStats, mi *metricsInfo) {
 		return
 	}
 	switch st := s.(type) {
-	case *stats.InHeader, *stats.OutHeader, *stats.InTrailer, *stats.OutTrailer:
-		// Headers and Trailers are not relevant to the measures, as the
-		// measures concern number of messages and bytes for messages. This
+	case *stats.InHeader, *stats.OutHeader, *stats.InTrailer, *stats.OutTrailer, *stats.PickerUpdated:
+		// Headers, Trailers, and picker updates are not relevant to the measures,
+		// as the measures concern number of messages and bytes for messages. This
 		// aligns with flow control.
 	case *stats.Begin:
 		recordDataBegin(ctx, mi, st)
@@ -156,6 +165,7 @@ func recordDataBegin(ctx context.Context, mi *metricsInfo, b *stats.Begin) {
 func recordDataOutPayload(mi *metricsInfo, op *stats.OutPayload) {
 	atomic.AddInt64(&mi.sentMsgs, 1)
 	atomic.AddInt64(&mi.sentBytes, int64(op.Length))
+	atomic.AddInt64(&mi.sentCompressedBytes, int64(op.CompressedLength))
 }
 
 // recordDataInPayload records the length in bytes of incoming messages and
@@ -164,6 +174,7 @@ func recordDataOutPayload(mi *metricsInfo, op *stats.OutPayload) {
 func recordDataInPayload(mi *metricsInfo, ip *stats.InPayload) {
 	atomic.AddInt64(&mi.recvMsgs, 1)
 	atomic.AddInt64(&mi.recvBytes, int64(ip.Length))
+	atomic.AddInt64(&mi.recvCompressedBytes, int64(ip.CompressedLength))
 }
 
 // recordDataEnd takes per RPC measurements derived from information derived
@@ -189,9 +200,11 @@ func recordDataEnd(ctx context.Context, mi *metricsInfo, e *stats.End) {
 				tag.Upsert(keyClientStatus, st)),
 			ocstats.WithMeasurements(
 				clientSentBytesPerRPC.M(atomic.LoadInt64(&mi.sentBytes)),
+				clientSentCompressedBytesPerRPC.M(atomic.LoadInt64(&mi.sentCompressedBytes)),
 				clientSentMessagesPerRPC.M(atomic.LoadInt64(&mi.sentMsgs)),
 				clientReceivedMessagesPerRPC.M(atomic.LoadInt64(&mi.recvMsgs)),
 				clientReceivedBytesPerRPC.M(atomic.LoadInt64(&mi.recvBytes)),
+				clientReceivedCompressedBytesPerRPC.M(atomic.LoadInt64(&mi.recvCompressedBytes)),
 				clientRoundtripLatency.M(latency),
 				clientServerLatency.M(latency),
 			))
@@ -204,8 +217,10 @@ func recordDataEnd(ctx context.Context, mi *metricsInfo, e *stats.End) {
 		),
 		ocstats.WithMeasurements(
 			serverSentBytesPerRPC.M(atomic.LoadInt64(&mi.sentBytes)),
+			serverSentCompressedBytesPerRPC.M(atomic.LoadInt64(&mi.sentCompressedBytes)),
 			serverSentMessagesPerRPC.M(atomic.LoadInt64(&mi.sentMsgs)),
 			serverReceivedMessagesPerRPC.M(atomic.LoadInt64(&mi.recvMsgs)),
 			serverReceivedBytesPerRPC.M(atomic.LoadInt64(&mi.recvBytes)),
+			serverReceivedCompressedBytesPerRPC.M(atomic.LoadInt64(&mi.recvCompressedBytes)),
 			serverLatency.M(latency)))
 }

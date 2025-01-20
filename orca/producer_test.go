@@ -23,11 +23,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/testutils"
@@ -36,6 +36,7 @@ import (
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	v3orcapb "github.com/cncf/xds/go/xds/data/orca/v3"
 	v3orcaservicegrpc "github.com/cncf/xds/go/xds/service/orca/v3"
@@ -64,13 +65,19 @@ func (w *ccWrapper) NewSubConn(addrs []resolver.Address, opts balancer.NewSubCon
 	if len(addrs) != 1 {
 		panic(fmt.Sprintf("got addrs=%v; want len(addrs) == 1", addrs))
 	}
+	var sc balancer.SubConn
+	opts.StateListener = func(scs balancer.SubConnState) {
+		if scs.ConnectivityState != connectivity.Ready {
+			return
+		}
+		l := getListenerInfo(addrs[0])
+		l.listener.cleanup = orca.RegisterOOBListener(sc, l.listener, l.opts)
+		l.scChan <- sc
+	}
 	sc, err := w.ClientConn.NewSubConn(addrs, opts)
 	if err != nil {
 		return sc, err
 	}
-	l := getListenerInfo(addrs[0])
-	l.listener.cleanup = orca.RegisterOOBListener(sc, l.listener, l.opts)
-	l.sc = sc
 	return sc, nil
 }
 
@@ -79,7 +86,7 @@ func (w *ccWrapper) NewSubConn(addrs []resolver.Address, opts balancer.NewSubCon
 type listenerInfo struct {
 	listener *testOOBListener
 	opts     orca.OOBListenerOptions
-	sc       balancer.SubConn // Set by the LB policy
+	scChan   chan balancer.SubConn // Pushed on by the LB policy
 }
 
 type listenerInfoKey struct{}
@@ -128,11 +135,11 @@ func (s) TestProducer(t *testing.T) {
 
 	// Register the OpenRCAService with a very short metrics reporting interval.
 	const shortReportingInterval = 50 * time.Millisecond
-	opts := orca.ServiceOptions{MinReportingInterval: shortReportingInterval}
+	smr := orca.NewServerMetricsRecorder()
+	opts := orca.ServiceOptions{MinReportingInterval: shortReportingInterval, ServerMetricsProvider: smr}
 	internal.AllowAnyMinReportingInterval.(func(*orca.ServiceOptions))(&opts)
 	s := grpc.NewServer()
-	orcaSrv, err := orca.Register(s, opts)
-	if err != nil {
+	if err := orca.Register(s, opts); err != nil {
 		t.Fatalf("orca.Register failed: %v", err)
 	}
 	go s.Serve(lis)
@@ -143,27 +150,28 @@ func (s) TestProducer(t *testing.T) {
 	oobLis := newTestOOBListener()
 
 	lisOpts := orca.OOBListenerOptions{ReportInterval: 50 * time.Millisecond}
-	li := &listenerInfo{listener: oobLis, opts: lisOpts}
+	li := &listenerInfo{scChan: make(chan balancer.SubConn, 1), listener: oobLis, opts: lisOpts}
 	addr := setListenerInfo(resolver.Address{Addr: lis.Addr().String()}, li)
 	r.InitialState(resolver.State{Addresses: []resolver.Address{addr}})
-	cc, err := grpc.Dial("whatever:///whatever", grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"customLB":{}}]}`), grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dopts := []grpc.DialOption{
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"customLB":{}}]}`),
+		grpc.WithResolvers(r),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	}
+	cc, err := grpc.NewClient("whatever:///whatever", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
-
-	// Ensure the OOB listener is stopped before the client is closed to avoid
-	// a potential irrelevant error in the logs.
-	defer oobLis.Stop()
-
+	cc.Connect()
 	// Set a few metrics and wait for them on the client side.
-	orcaSrv.SetCPUUtilization(10)
-	orcaSrv.SetMemoryUtilization(100)
-	orcaSrv.SetUtilization("bob", 555)
+	smr.SetCPUUtilization(10)
+	smr.SetMemoryUtilization(0.1)
+	smr.SetNamedUtilization("bob", 0.555)
 	loadReportWant := &v3orcapb.OrcaLoadReport{
 		CpuUtilization: 10,
-		MemUtilization: 100,
-		Utilization:    map[string]float64{"bob": 555},
+		MemUtilization: 0.1,
+		Utilization:    map[string]float64{"bob": 0.555},
 	}
 
 testReport:
@@ -181,13 +189,13 @@ testReport:
 	}
 
 	// Change and add metrics and wait for them on the client side.
-	orcaSrv.SetCPUUtilization(50)
-	orcaSrv.SetMemoryUtilization(200)
-	orcaSrv.SetUtilization("mary", 321)
+	smr.SetCPUUtilization(0.5)
+	smr.SetMemoryUtilization(0.2)
+	smr.SetNamedUtilization("mary", 0.321)
 	loadReportWant = &v3orcapb.OrcaLoadReport{
-		CpuUtilization: 50,
-		MemUtilization: 200,
-		Utilization:    map[string]float64{"bob": 555, "mary": 321},
+		CpuUtilization: 0.5,
+		MemUtilization: 0.2,
+		Utilization:    map[string]float64{"bob": 0.555, "mary": 0.321},
 	}
 
 	for {
@@ -202,6 +210,7 @@ testReport:
 			t.Fatalf("timed out waiting for load report: %v", loadReportWant)
 		}
 	}
+
 }
 
 // fakeORCAService is a simple implementation of an ORCA service that pushes
@@ -212,13 +221,13 @@ type fakeORCAService struct {
 	v3orcaservicegrpc.UnimplementedOpenRcaServiceServer
 
 	reqCh  chan *v3orcaservicepb.OrcaLoadReportRequest
-	respCh chan interface{} // either *v3orcapb.OrcaLoadReport or error
+	respCh chan any // either *v3orcapb.OrcaLoadReport or error
 }
 
 func newFakeORCAService() *fakeORCAService {
 	return &fakeORCAService{
 		reqCh:  make(chan *v3orcaservicepb.OrcaLoadReportRequest),
-		respCh: make(chan interface{}),
+		respCh: make(chan any),
 	}
 }
 
@@ -228,7 +237,14 @@ func (f *fakeORCAService) close() {
 
 func (f *fakeORCAService) StreamCoreMetrics(req *v3orcaservicepb.OrcaLoadReportRequest, stream v3orcaservicegrpc.OpenRcaService_StreamCoreMetricsServer) error {
 	f.reqCh <- req
-	for resp := range f.respCh {
+	for {
+		var resp any
+		select {
+		case resp = <-f.respCh:
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+
 		if err, ok := resp.(error); ok {
 			return err
 		}
@@ -245,7 +261,6 @@ func (f *fakeORCAService) StreamCoreMetrics(req *v3orcaservicepb.OrcaLoadReportR
 			return err
 		}
 	}
-	return nil
 }
 
 // TestProducerBackoff verifies that the ORCA producer applies the proper
@@ -307,23 +322,25 @@ func (s) TestProducerBackoff(t *testing.T) {
 	oobLis := newTestOOBListener()
 
 	lisOpts := orca.OOBListenerOptions{ReportInterval: reportInterval}
-	li := &listenerInfo{listener: oobLis, opts: lisOpts}
+	li := &listenerInfo{scChan: make(chan balancer.SubConn, 1), listener: oobLis, opts: lisOpts}
 	r.InitialState(resolver.State{Addresses: []resolver.Address{setListenerInfo(resolver.Address{Addr: lis.Addr().String()}, li)}})
-	cc, err := grpc.Dial("whatever:///whatever", grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"customLB":{}}]}`), grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("grpc.Dial failed: %v", err)
+	dopts := []grpc.DialOption{
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"customLB":{}}]}`),
+		grpc.WithResolvers(r),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	}
+	cc, err := grpc.NewClient("whatever:///whatever", dopts...)
+	if err != nil {
+		t.Fatalf("grpc.NewClient failed: %v", err)
+	}
+	cc.Connect()
 	defer cc.Close()
-
-	// Ensure the OOB listener is stopped before the client is closed to avoid
-	// a potential irrelevant error in the logs.
-	defer oobLis.Stop()
 
 	// Define a load report to send and expect the client to see.
 	loadReportWant := &v3orcapb.OrcaLoadReport{
 		CpuUtilization: 10,
-		MemUtilization: 100,
-		Utilization:    map[string]float64{"bob": 555},
+		MemUtilization: 0.1,
+		Utilization:    map[string]float64{"bob": 0.555},
 	}
 
 	// Unblock the fake.
@@ -423,12 +440,13 @@ func (s) TestProducerMultipleListeners(t *testing.T) {
 	r := manual.NewBuilderWithScheme("whatever")
 	oobLis1 := newTestOOBListener()
 	lisOpts1 := orca.OOBListenerOptions{ReportInterval: reportInterval1}
-	li := &listenerInfo{listener: oobLis1, opts: lisOpts1}
+	li := &listenerInfo{scChan: make(chan balancer.SubConn, 1), listener: oobLis1, opts: lisOpts1}
 	r.InitialState(resolver.State{Addresses: []resolver.Address{setListenerInfo(resolver.Address{Addr: lis.Addr().String()}, li)}})
-	cc, err := grpc.Dial("whatever:///whatever", grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"customLB":{}}]}`), grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient("whatever:///whatever", grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"customLB":{}}]}`), grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
+	cc.Connect()
 	defer cc.Close()
 
 	// Ensure the OOB listener is stopped before the client is closed to avoid
@@ -444,8 +462,8 @@ func (s) TestProducerMultipleListeners(t *testing.T) {
 	// Define a load report to send and expect the client to see.
 	loadReportWant := &v3orcapb.OrcaLoadReport{
 		CpuUtilization: 10,
-		MemUtilization: 100,
-		Utilization:    map[string]float64{"bob": 555},
+		MemUtilization: 0.1,
+		Utilization:    map[string]float64{"bob": 0.555},
 	}
 
 	// Receive reports and update counts for the three listeners.
@@ -512,19 +530,19 @@ func (s) TestProducerMultipleListeners(t *testing.T) {
 	fake.respCh <- loadReportWant
 	checkReports(1, 0, 0)
 
+	sc := <-li.scChan
 	// Register listener 2 with a less frequent interval; no need to recreate
 	// stream.  Report should go to both listeners.
-	oobLis2.cleanup = orca.RegisterOOBListener(li.sc, oobLis2, lisOpts2)
+	oobLis2.cleanup = orca.RegisterOOBListener(sc, oobLis2, lisOpts2)
 	fake.respCh <- loadReportWant
 	checkReports(2, 1, 0)
 
 	// Register listener 3 with a more frequent interval; stream is recreated
-	// with this interval after the next report is received.  The first report
-	// will go to all three listeners.
-	oobLis3.cleanup = orca.RegisterOOBListener(li.sc, oobLis3, lisOpts3)
+	// with this interval.  The next report will go to all three listeners.
+	oobLis3.cleanup = orca.RegisterOOBListener(sc, oobLis3, lisOpts3)
+	awaitRequest(reportInterval3)
 	fake.respCh <- loadReportWant
 	checkReports(3, 2, 1)
-	awaitRequest(reportInterval3)
 
 	// Another report without a change in listeners should go to all three listeners.
 	fake.respCh <- loadReportWant
@@ -536,13 +554,12 @@ func (s) TestProducerMultipleListeners(t *testing.T) {
 	fake.respCh <- loadReportWant
 	checkReports(5, 3, 3)
 
-	// Stop listener 3.  This makes the interval longer, with stream recreation
-	// delayed until the next report is received.  Reports should only go to
-	// listener 1 now.
+	// Stop listener 3.  This makes the interval longer.  Reports should only
+	// go to listener 1 now.
 	oobLis3.Stop()
+	awaitRequest(reportInterval1)
 	fake.respCh <- loadReportWant
 	checkReports(6, 3, 3)
-	awaitRequest(reportInterval1)
 	// Another report without a change in listeners should go to the first listener.
 	fake.respCh <- loadReportWant
 	checkReports(7, 3, 3)

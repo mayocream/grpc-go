@@ -29,10 +29,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/channelz"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
-	testgrpc "google.golang.org/grpc/test/grpc_testing"
-	testpb "google.golang.org/grpc/test/grpc_testing"
 )
 
 // TestClientConnClose_WithPendingRPC tests the scenario where the channel has
@@ -40,14 +40,10 @@ import (
 // blocking. The test verifies that closing the ClientConn unblocks the RPC with
 // the expected error code.
 func (s) TestClientConnClose_WithPendingRPC(t *testing.T) {
-	// Initialize channelz. Used to determine pending RPC count.
-	czCleanup := channelz.NewChannelzStorageForTesting()
-	defer czCleanupWrapper(czCleanup, t)
-
 	r := manual.NewBuilderWithScheme("whatever")
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	client := testgrpc.NewTestServiceClient(cc)
 
@@ -75,8 +71,8 @@ func (s) TestClientConnClose_WithPendingRPC(t *testing.T) {
 		if len(tcs) != 1 {
 			t.Fatalf("there should only be one top channel, not %d", len(tcs))
 		}
-		started := tcs[0].ChannelData.CallsStarted
-		completed := tcs[0].ChannelData.CallsSucceeded + tcs[0].ChannelData.CallsFailed
+		started := tcs[0].ChannelMetrics.CallsStarted.Load()
+		completed := tcs[0].ChannelMetrics.CallsSucceeded.Load() + tcs[0].ChannelMetrics.CallsFailed.Load()
 		if (started - completed) == 1 {
 			break
 		}

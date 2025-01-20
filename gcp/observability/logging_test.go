@@ -31,11 +31,13 @@ import (
 	gcplogging "cloud.google.com/go/logging"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	binlogpb "google.golang.org/grpc/binarylog/grpc_binarylog_v1"
 	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/test/grpc_testing"
+
+	binlogpb "google.golang.org/grpc/binarylog/grpc_binarylog_v1"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
 func cmpLoggingEntryList(got []*grpcLogEntry, want []*grpcLogEntry) error {
@@ -68,6 +70,8 @@ type fakeLoggingExporter struct {
 
 	mu      sync.Mutex
 	entries []*grpcLogEntry
+
+	idsSeen []*traceAndSpanIDString
 }
 
 func (fle *fakeLoggingExporter) EmitGcpLoggingEntry(entry gcplogging.Entry) {
@@ -76,6 +80,14 @@ func (fle *fakeLoggingExporter) EmitGcpLoggingEntry(entry gcplogging.Entry) {
 	if entry.Severity != 100 {
 		fle.t.Errorf("entry.Severity is not 100, this should be hardcoded")
 	}
+
+	ids := &traceAndSpanIDString{
+		traceID:   entry.Trace,
+		spanID:    entry.SpanID,
+		isSampled: entry.TraceSampled,
+	}
+	fle.idsSeen = append(fle.idsSeen, ids)
+
 	grpcLogEntry, ok := entry.Payload.(*grpcLogEntry)
 	if !ok {
 		fle.t.Errorf("payload passed in isn't grpcLogEntry")
@@ -122,7 +134,7 @@ func (s) TestClientRPCEventsLogAll(t *testing.T) {
 		newLoggingExporter = ne
 	}(newLoggingExporter)
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(context.Context, *config) (loggingExporter, error) {
 		return fle, nil
 	}
 
@@ -145,14 +157,14 @@ func (s) TestClientRPCEventsLogAll(t *testing.T) {
 	defer cleanup()
 
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
-			return &grpc_testing.SimpleResponse{}, nil
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
 		},
-		FullDuplexCallF: func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
 			if _, err := stream.Recv(); err != nil {
 				return err
 			}
-			if err := stream.Send(&grpc_testing.StreamingOutputCallResponse{}); err != nil {
+			if err := stream.Send(&testpb.StreamingOutputCallResponse{}); err != nil {
 				return err
 			}
 			if _, err := stream.Recv(); err != io.EOF {
@@ -168,7 +180,7 @@ func (s) TestClientRPCEventsLogAll(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{}); err != nil {
+	if _, err := ss.Client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
 		t.Fatalf("Unexpected error from UnaryCall: %v", err)
 	}
 
@@ -192,7 +204,7 @@ func (s) TestClientRPCEventsLogAll(t *testing.T) {
 			SequenceID:  2,
 			Authority:   ss.Address,
 			Payload: payload{
-				Message: []uint8{},
+				Message: nil,
 			},
 		},
 		{
@@ -222,7 +234,8 @@ func (s) TestClientRPCEventsLogAll(t *testing.T) {
 			SequenceID:  5,
 			Authority:   ss.Address,
 			Payload: payload{
-				Metadata: map[string]string{},
+				Metadata:   map[string]string{},
+				StatusCode: "OK",
 			},
 		},
 	}
@@ -240,7 +253,7 @@ func (s) TestClientRPCEventsLogAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ss.Client.FullDuplexCall failed: %f", err)
 	}
-	if err := stream.Send(&grpc_testing.StreamingOutputCallRequest{}); err != nil {
+	if err := stream.Send(&testpb.StreamingOutputCallRequest{}); err != nil {
 		t.Fatalf("stream.Send() failed: %v", err)
 	}
 	if _, err := stream.Recv(); err != nil {
@@ -272,7 +285,7 @@ func (s) TestClientRPCEventsLogAll(t *testing.T) {
 			SequenceID:  2,
 			Authority:   ss.Address,
 			Payload: payload{
-				Message: []uint8{},
+				Message: nil,
 			},
 		},
 		{
@@ -310,7 +323,8 @@ func (s) TestClientRPCEventsLogAll(t *testing.T) {
 			Authority:   ss.Address,
 			SequenceID:  6,
 			Payload: payload{
-				Metadata: map[string]string{},
+				Metadata:   map[string]string{},
+				StatusCode: "OK",
 			},
 		},
 	}
@@ -330,7 +344,7 @@ func (s) TestServerRPCEventsLogAll(t *testing.T) {
 		newLoggingExporter = ne
 	}(newLoggingExporter)
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(context.Context, *config) (loggingExporter, error) {
 		return fle, nil
 	}
 
@@ -353,14 +367,14 @@ func (s) TestServerRPCEventsLogAll(t *testing.T) {
 	defer cleanup()
 
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
-			return &grpc_testing.SimpleResponse{}, nil
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
 		},
-		FullDuplexCallF: func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
 			if _, err := stream.Recv(); err != nil {
 				return err
 			}
-			if err := stream.Send(&grpc_testing.StreamingOutputCallResponse{}); err != nil {
+			if err := stream.Send(&testpb.StreamingOutputCallResponse{}); err != nil {
 				return err
 			}
 			if _, err := stream.Recv(); err != io.EOF {
@@ -376,7 +390,7 @@ func (s) TestServerRPCEventsLogAll(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{}); err != nil {
+	if _, err := ss.Client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
 		t.Fatalf("Unexpected error from UnaryCall: %v", err)
 	}
 	grpcLogEntriesWant := []*grpcLogEntry{
@@ -429,7 +443,8 @@ func (s) TestServerRPCEventsLogAll(t *testing.T) {
 			SequenceID:  5,
 			Authority:   ss.Address,
 			Payload: payload{
-				Metadata: map[string]string{},
+				Metadata:   map[string]string{},
+				StatusCode: "OK",
 			},
 		},
 	}
@@ -445,7 +460,7 @@ func (s) TestServerRPCEventsLogAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ss.Client.FullDuplexCall failed: %f", err)
 	}
-	if err := stream.Send(&grpc_testing.StreamingOutputCallRequest{}); err != nil {
+	if err := stream.Send(&testpb.StreamingOutputCallRequest{}); err != nil {
 		t.Fatalf("stream.Send() failed: %v", err)
 	}
 	if _, err := stream.Recv(); err != nil {
@@ -497,7 +512,7 @@ func (s) TestServerRPCEventsLogAll(t *testing.T) {
 			SequenceID:  4,
 			Authority:   ss.Address,
 			Payload: payload{
-				Message: []uint8{},
+				Message: nil,
 			},
 		},
 		{
@@ -516,7 +531,8 @@ func (s) TestServerRPCEventsLogAll(t *testing.T) {
 			Authority:   ss.Address,
 			SequenceID:  6,
 			Payload: payload{
-				Metadata: map[string]string{},
+				Metadata:   map[string]string{},
+				StatusCode: "OK",
 			},
 		},
 	}
@@ -532,7 +548,7 @@ func (s) TestServerRPCEventsLogAll(t *testing.T) {
 // Client and Server RPC Events configured to log. Both sides should log and
 // share the exporter, so the exporter should receive the collective amount of
 // calls for both a client stream (corresponding to a Client RPC Event) and a
-// server stream (corresponding ot a Server RPC Event). The specificity of the
+// server stream (corresponding to a Server RPC Event). The specificity of the
 // entries are tested in previous tests.
 func (s) TestBothClientAndServerRPCEvents(t *testing.T) {
 	fle := &fakeLoggingExporter{
@@ -542,7 +558,7 @@ func (s) TestBothClientAndServerRPCEvents(t *testing.T) {
 		newLoggingExporter = ne
 	}(newLoggingExporter)
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(context.Context, *config) (loggingExporter, error) {
 		return fle, nil
 	}
 
@@ -573,10 +589,10 @@ func (s) TestBothClientAndServerRPCEvents(t *testing.T) {
 	defer cleanup()
 
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
-			return &grpc_testing.SimpleResponse{}, nil
+		UnaryCallF: func(_ context.Context, _ *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
 		},
-		FullDuplexCallF: func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
 			_, err := stream.Recv()
 			if err != io.EOF {
 				return err
@@ -595,7 +611,7 @@ func (s) TestBothClientAndServerRPCEvents(t *testing.T) {
 	// entries is checked in previous tests).
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{}); err != nil {
+	if _, err := ss.Client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
 		t.Fatalf("Unexpected error from UnaryCall: %v", err)
 	}
 	fle.mu.Lock()
@@ -634,7 +650,7 @@ func (s) TestClientRPCEventsTruncateHeaderAndMetadata(t *testing.T) {
 		newLoggingExporter = ne
 	}(newLoggingExporter)
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(_ context.Context, _ *config) (loggingExporter, error) {
 		return fle, nil
 	}
 
@@ -657,8 +673,8 @@ func (s) TestClientRPCEventsTruncateHeaderAndMetadata(t *testing.T) {
 	defer cleanup()
 
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
-			return &grpc_testing.SimpleResponse{}, nil
+		UnaryCallF: func(_ context.Context, _ *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
 		},
 	}
 	if err := ss.Start(nil); err != nil {
@@ -674,7 +690,7 @@ func (s) TestClientRPCEventsTruncateHeaderAndMetadata(t *testing.T) {
 		"key2": []string{"value2"},
 	}
 	ctx = metadata.NewOutgoingContext(ctx, md)
-	if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{Payload: &grpc_testing.Payload{Body: []byte("00000")}}); err != nil {
+	if _, err := ss.Client.UnaryCall(ctx, &testpb.SimpleRequest{Payload: &testpb.Payload{Body: []byte("00000")}}); err != nil {
 		t.Fatalf("Unexpected error from UnaryCall: %v", err)
 	}
 	grpcLogEntriesWant := []*grpcLogEntry{
@@ -736,7 +752,8 @@ func (s) TestClientRPCEventsTruncateHeaderAndMetadata(t *testing.T) {
 			SequenceID:  5,
 			Authority:   ss.Address,
 			Payload: payload{
-				Metadata: map[string]string{},
+				Metadata:   map[string]string{},
+				StatusCode: "OK",
 			},
 		},
 	}
@@ -770,7 +787,7 @@ func (s) TestPrecedenceOrderingInConfiguration(t *testing.T) {
 		newLoggingExporter = ne
 	}(newLoggingExporter)
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(_ context.Context, _ *config) (loggingExporter, error) {
 		return fle, nil
 	}
 
@@ -805,13 +822,13 @@ func (s) TestPrecedenceOrderingInConfiguration(t *testing.T) {
 	defer cleanup()
 
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *grpc_testing.Empty) (*grpc_testing.Empty, error) {
-			return &grpc_testing.Empty{}, nil
+		EmptyCallF: func(_ context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
+			return &testpb.Empty{}, nil
 		},
-		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
-			return &grpc_testing.SimpleResponse{}, nil
+		UnaryCallF: func(_ context.Context, _ *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
 		},
-		FullDuplexCallF: func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
 			_, err := stream.Recv()
 			if err != io.EOF {
 				return err
@@ -830,7 +847,7 @@ func (s) TestPrecedenceOrderingInConfiguration(t *testing.T) {
 	// future.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{}); err != nil {
+	if _, err := ss.Client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
 		t.Fatalf("Unexpected error from UnaryCall: %v", err)
 	}
 	grpcLogEntriesWant := []*grpcLogEntry{
@@ -853,7 +870,7 @@ func (s) TestPrecedenceOrderingInConfiguration(t *testing.T) {
 			SequenceID:  2,
 			Authority:   ss.Address,
 			Payload: payload{
-				Message: []uint8{},
+				Message: nil,
 			},
 		},
 		{
@@ -883,7 +900,8 @@ func (s) TestPrecedenceOrderingInConfiguration(t *testing.T) {
 			SequenceID:  5,
 			Authority:   ss.Address,
 			Payload: payload{
-				Metadata: map[string]string{},
+				Metadata:   map[string]string{},
+				StatusCode: "OK",
 			},
 		},
 	}
@@ -898,7 +916,7 @@ func (s) TestPrecedenceOrderingInConfiguration(t *testing.T) {
 
 	// A unary empty RPC should match with the second event, which has the exclude
 	// flag set. Thus, a unary empty RPC should cause no downstream logs.
-	if _, err := ss.Client.EmptyCall(ctx, &grpc_testing.Empty{}); err != nil {
+	if _, err := ss.Client.EmptyCall(ctx, &testpb.Empty{}); err != nil {
 		t.Fatalf("Unexpected error from EmptyCall: %v", err)
 	}
 	// The exporter should have received no new log entries due to this call.
@@ -950,7 +968,8 @@ func (s) TestPrecedenceOrderingInConfiguration(t *testing.T) {
 			Authority:   ss.Address,
 			SequenceID:  3,
 			Payload: payload{
-				Metadata: map[string]string{},
+				Metadata:   map[string]string{},
+				StatusCode: "OK",
 			},
 		},
 	}
@@ -1062,65 +1081,6 @@ func (s) TestTranslateMetadata(t *testing.T) {
 	}
 }
 
-// TestCloudLoggingAPICallsFiltered tests that the observability plugin does not
-// emit logs for cloud logging API calls.
-func (s) TestCloudLoggingAPICallsFiltered(t *testing.T) {
-	fle := &fakeLoggingExporter{
-		t: t,
-	}
-
-	defer func(ne func(ctx context.Context, config *config) (loggingExporter, error)) {
-		newLoggingExporter = ne
-	}(newLoggingExporter)
-
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
-		return fle, nil
-	}
-	configLogAll := &config{
-		ProjectID: "fake",
-		CloudLogging: &cloudLogging{
-			ClientRPCEvents: []clientRPCEvents{
-				{
-					Methods:          []string{"*"},
-					MaxMetadataBytes: 30,
-					MaxMessageBytes:  30,
-				},
-			},
-		},
-	}
-	cleanup, err := setupObservabilitySystemWithConfig(configLogAll)
-	if err != nil {
-		t.Fatalf("error setting up observability %v", err)
-	}
-	defer cleanup()
-
-	ss := &stubserver.StubServer{}
-	if err := ss.Start(nil); err != nil {
-		t.Fatalf("Error starting endpoint server: %v", err)
-	}
-	defer ss.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-
-	// Any of the three cloud logging API calls should not cause any logs to be
-	// emitted, even though the configuration specifies to log any rpc
-	// regardless of method.
-	req := &grpc_testing.SimpleRequest{}
-	resp := &grpc_testing.SimpleResponse{}
-
-	ss.CC.Invoke(ctx, "/google.logging.v2.LoggingServiceV2/some-method", req, resp)
-	ss.CC.Invoke(ctx, "/google.monitoring.v3.MetricService/some-method", req, resp)
-	ss.CC.Invoke(ctx, "/google.devtools.cloudtrace.v2.TraceService/some-method", req, resp)
-	// The exporter should have received no new log entries due to these three
-	// calls, as they should be filtered out.
-	fle.mu.Lock()
-	defer fle.mu.Unlock()
-	if len(fle.entries) != 0 {
-		t.Fatalf("Unexpected length of entries %v, want 0", len(fle.entries))
-	}
-}
-
 func (s) TestMarshalJSON(t *testing.T) {
 	logEntry := &grpcLogEntry{
 		CallID:     "300-300-300",
@@ -1130,14 +1090,14 @@ func (s) TestMarshalJSON(t *testing.T) {
 		Payload: payload{
 			Metadata:      map[string]string{"header1": "value1"},
 			Timeout:       20,
-			StatusCode:    3,
+			StatusCode:    "UNKNOWN",
 			StatusMessage: "ok",
 			StatusDetails: []byte("ok"),
 			MessageLength: 3,
 			Message:       []byte("wow"),
 		},
 		Peer: address{
-			Type:    typeIPv4,
+			Type:    ipv4,
 			Address: "localhost",
 			IPPort:  16000,
 		},
@@ -1165,7 +1125,7 @@ func (s) TestMetadataTruncationAccountsKey(t *testing.T) {
 		newLoggingExporter = ne
 	}(newLoggingExporter)
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(_ context.Context, _ *config) (loggingExporter, error) {
 		return fle, nil
 	}
 
@@ -1189,8 +1149,8 @@ func (s) TestMetadataTruncationAccountsKey(t *testing.T) {
 	defer cleanup()
 
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
-			return &grpc_testing.SimpleResponse{}, nil
+		UnaryCallF: func(_ context.Context, _ *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{}, nil
 		},
 	}
 	if err := ss.Start(nil); err != nil {
@@ -1201,13 +1161,13 @@ func (s) TestMetadataTruncationAccountsKey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
-	// the set config MaxMetdataBytes is in between len(mdValue) and len("key")
+	// the set config MaxMetadataBytes is in between len(mdValue) and len("key")
 	// + len(mdValue), and thus shouldn't log this metadata entry.
 	md := metadata.MD{
 		"key": []string{mdValue},
 	}
 	ctx = metadata.NewOutgoingContext(ctx, md)
-	if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{Payload: &grpc_testing.Payload{Body: []byte("00000")}}); err != nil {
+	if _, err := ss.Client.UnaryCall(ctx, &testpb.SimpleRequest{Payload: &testpb.Payload{Body: []byte("00000")}}); err != nil {
 		t.Fatalf("Unexpected error from UnaryCall: %v", err)
 	}
 
@@ -1264,7 +1224,8 @@ func (s) TestMetadataTruncationAccountsKey(t *testing.T) {
 			SequenceID:  5,
 			Authority:   ss.Address,
 			Payload: payload{
-				Metadata: map[string]string{},
+				Metadata:   map[string]string{},
+				StatusCode: "OK",
 			},
 		},
 	}
@@ -1279,6 +1240,7 @@ func (s) TestMetadataTruncationAccountsKey(t *testing.T) {
 // TestMethodInConfiguration tests different method names with an expectation on
 // whether they should error or not.
 func (s) TestMethodInConfiguration(t *testing.T) {
+
 	// To skip creating a stackdriver exporter.
 	fle := &fakeLoggingExporter{
 		t: t,
@@ -1288,7 +1250,7 @@ func (s) TestMethodInConfiguration(t *testing.T) {
 		newLoggingExporter = ne
 	}(newLoggingExporter)
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(_ context.Context, _ *config) (loggingExporter, error) {
 		return fle, nil
 	}
 

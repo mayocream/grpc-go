@@ -25,8 +25,6 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/golang/protobuf/ptypes"
-	durationpb "github.com/golang/protobuf/ptypes/duration"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/rls/internal/keys"
 	"google.golang.org/grpc/internal"
@@ -35,6 +33,7 @@ import (
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 const (
@@ -144,7 +143,10 @@ type lbConfigJSON struct {
 //	- childPolicyConfigTargetFieldName:
 //	  - must be set and non-empty
 func (rlsBB) ParseConfig(c json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
-	logger.Infof("Received JSON service config: %v", pretty.ToJSON(c))
+	if logger.V(2) {
+		logger.Infof("Received JSON service config: %v", pretty.ToJSON(c))
+	}
+
 	cfgJSON := &lbConfigJSON{}
 	if err := json.Unmarshal(c, cfgJSON); err != nil {
 		return nil, fmt.Errorf("rls: json unmarshal failed for service config %+v: %v", string(c), err)
@@ -308,5 +310,5 @@ func convertDuration(d *durationpb.Duration) (time.Duration, error) {
 	if d == nil {
 		return 0, nil
 	}
-	return ptypes.Duration(d)
+	return d.AsDuration(), d.CheckValid()
 }

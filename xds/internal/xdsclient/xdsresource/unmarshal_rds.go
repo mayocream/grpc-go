@@ -19,21 +19,23 @@ package xdsresource
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/internal/xds/matcher"
+	"google.golang.org/grpc/xds/internal/clusterspecifier"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+
 	v3routepb "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	v3typepb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-	"github.com/golang/protobuf/proto"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/internal/envconfig"
-	"google.golang.org/grpc/xds/internal/clusterspecifier"
-	"google.golang.org/protobuf/types/known/anypb"
 )
 
 func unmarshalRouteConfigResource(r *anypb.Any) (string, RouteConfigUpdate, error) {
-	r, err := unwrapResource(r)
+	r, err := UnwrapResource(r)
 	if err != nil {
 		return "", RouteConfigUpdate{}, fmt.Errorf("failed to unwrap resource: %v", err)
 	}
@@ -72,13 +74,9 @@ func unmarshalRouteConfigResource(r *anypb.Any) (string, RouteConfigUpdate, erro
 // we are looking for.
 func generateRDSUpdateFromRouteConfiguration(rc *v3routepb.RouteConfiguration) (RouteConfigUpdate, error) {
 	vhs := make([]*VirtualHost, 0, len(rc.GetVirtualHosts()))
-	csps := make(map[string]clusterspecifier.BalancerConfig)
-	if envconfig.XDSRLS {
-		var err error
-		csps, err = processClusterSpecifierPlugins(rc.ClusterSpecifierPlugins)
-		if err != nil {
-			return RouteConfigUpdate{}, fmt.Errorf("received route is invalid: %v", err)
-		}
+	csps, err := processClusterSpecifierPlugins(rc.ClusterSpecifierPlugins)
+	if err != nil {
+		return RouteConfigUpdate{}, fmt.Errorf("received route is invalid: %v", err)
 	}
 	// cspNames represents all the cluster specifiers referenced by Route
 	// Actions - any cluster specifiers not referenced by a Route Action can be
@@ -272,6 +270,12 @@ func routesProtoToSlice(routes []*v3routepb.Route, csps map[string]clusterspecif
 				header.PrefixMatch = &ht.PrefixMatch
 			case *v3routepb.HeaderMatcher_SuffixMatch:
 				header.SuffixMatch = &ht.SuffixMatch
+			case *v3routepb.HeaderMatcher_StringMatch:
+				sm, err := matcher.StringMatcherFromProto(ht.StringMatch)
+				if err != nil {
+					return nil, nil, fmt.Errorf("route %+v has an invalid string matcher: %v", err, ht.StringMatch)
+				}
+				header.StringMatch = &sm
 			default:
 				return nil, nil, fmt.Errorf("route %+v has an unrecognized header matcher: %+v", r, ht)
 			}
@@ -300,24 +304,26 @@ func routesProtoToSlice(routes []*v3routepb.Route, csps map[string]clusterspecif
 			action := r.GetRoute()
 
 			// Hash Policies are only applicable for a Ring Hash LB.
-			if envconfig.XDSRingHash {
-				hp, err := hashPoliciesProtoToSlice(action.HashPolicy)
-				if err != nil {
-					return nil, nil, err
-				}
-				route.HashPolicies = hp
+			hp, err := hashPoliciesProtoToSlice(action.HashPolicy)
+			if err != nil {
+				return nil, nil, err
 			}
+			route.HashPolicies = hp
 
 			switch a := action.GetClusterSpecifier().(type) {
 			case *v3routepb.RouteAction_Cluster:
 				route.WeightedClusters[a.Cluster] = WeightedCluster{Weight: 1}
 			case *v3routepb.RouteAction_WeightedClusters:
 				wcs := a.WeightedClusters
-				var totalWeight uint32
+				var totalWeight uint64
 				for _, c := range wcs.Clusters {
 					w := c.GetWeight().GetValue()
 					if w == 0 {
 						continue
+					}
+					totalWeight += uint64(w)
+					if totalWeight > math.MaxUint32 {
+						return nil, nil, fmt.Errorf("xds: total weight of clusters exceeds MaxUint32")
 					}
 					wc := WeightedCluster{Weight: w}
 					cfgs, err := processHTTPFilterOverrides(c.GetTypedPerFilterConfig())
@@ -326,16 +332,6 @@ func routesProtoToSlice(routes []*v3routepb.Route, csps map[string]clusterspecif
 					}
 					wc.HTTPFilterConfigOverride = cfgs
 					route.WeightedClusters[c.GetName()] = wc
-					totalWeight += w
-				}
-				// envoy xds doc
-				// default TotalWeight https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/route/v3/route_components.proto.html#envoy-v3-api-field-config-route-v3-weightedcluster-total-weight
-				wantTotalWeight := uint32(100)
-				if tw := wcs.GetTotalWeight(); tw != nil {
-					wantTotalWeight = tw.GetValue()
-				}
-				if totalWeight != wantTotalWeight {
-					return nil, nil, fmt.Errorf("route %+v, action %+v, weights of clusters do not add up to total total weight, got: %v, expected total weight from response: %v", r, a, totalWeight, wantTotalWeight)
 				}
 				if totalWeight == 0 {
 					return nil, nil, fmt.Errorf("route %+v, action %+v, has no valid cluster in WeightedCluster action", r, a)
@@ -347,17 +343,12 @@ func routesProtoToSlice(routes []*v3routepb.Route, csps map[string]clusterspecif
 				// cluster_specifier:
 				// - Can be Cluster
 				// - Can be Weighted_clusters
-				//   - The sum of weights must add up to the total_weight.
 				// - Can be unset or an unsupported field. The route containing
 				//   this action will be ignored.
 				//
 				// This means that if this env var is not set, we should treat
 				// it as if it we didn't know about the cluster_specifier_plugin
 				// at all.
-				if !envconfig.XDSRLS {
-					logger.Warningf("Ignoring route %+v with unsupported route_action field: cluster_specifier_plugin", r)
-					continue
-				}
 				if _, ok := csps[a.ClusterSpecifierPlugin]; !ok {
 					// "When processing RouteActions, if any action includes a
 					// cluster_specifier_plugin value that is not in
@@ -387,7 +378,6 @@ func routesProtoToSlice(routes []*v3routepb.Route, csps map[string]clusterspecif
 				route.MaxStreamDuration = &d
 			}
 
-			var err error
 			route.RetryConfig, err = generateRetryConfig(action.GetRetryPolicy())
 			if err != nil {
 				return nil, nil, fmt.Errorf("route %+v, action %+v: %v", r, action, err)

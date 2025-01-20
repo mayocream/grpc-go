@@ -32,7 +32,9 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/status"
-	testpb "google.golang.org/grpc/test/grpc_testing"
+
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
 type delayListener struct {
@@ -87,17 +89,17 @@ func (d *delayListener) Dial(ctx context.Context) (net.Conn, error) {
 	return (&net.Dialer{}).DialContext(ctx, "tcp", d.Listener.Addr().String())
 }
 
+// TestGracefulStop ensures GracefulStop causes new connections to fail.
+//
+// Steps of this test:
+//  1. Start Server
+//  2. GracefulStop() Server after listener's Accept is called, but don't
+//     allow Accept() to exit when Close() is called on it.
+//  3. Create a new connection to the server after listener.Close() is called.
+//     Server should close this connection immediately, before handshaking.
+//  4. Send an RPC on the new connection.  Should see Unavailable error
+//     because the ClientConn is in transient failure.
 func (s) TestGracefulStop(t *testing.T) {
-	// This test ensures GracefulStop causes new connections to fail.
-	//
-	// Steps of this test:
-	// 1. Start Server
-	// 2. GracefulStop() Server after listener's Accept is called, but don't
-	//    allow Accept() to exit when Close() is called on it.
-	// 3. Create a new connection to the server after listener.Close() is called.
-	//    Server should close this connection immediately, before handshaking.
-	// 4. Send an RPC on the new connection.  Should see Unavailable error
-	//    because the ClientConn is in transient failure.
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Error listenening: %v", err)
@@ -111,7 +113,7 @@ func (s) TestGracefulStop(t *testing.T) {
 	d := func(ctx context.Context, _ string) (net.Conn, error) { return dlis.Dial(ctx) }
 
 	ss := &stubserver.StubServer{
-		FullDuplexCallF: func(stream testpb.TestService_FullDuplexCallServer) error {
+		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
 			_, err := stream.Recv()
 			if err != nil {
 				return err
@@ -120,7 +122,7 @@ func (s) TestGracefulStop(t *testing.T) {
 		},
 	}
 	s := grpc.NewServer()
-	testpb.RegisterTestServiceServer(s, ss)
+	testgrpc.RegisterTestServiceServer(s, ss)
 
 	// 1. Start Server
 	wg := sync.WaitGroup{}
@@ -146,19 +148,19 @@ func (s) TestGracefulStop(t *testing.T) {
 
 	// Now dial.  The listener's Accept method will return a valid connection,
 	// even though GracefulStop has closed the listener.
-	ctx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, dialCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer dialCancel()
 	cc, err := grpc.DialContext(ctx, "", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(d))
 	if err != nil {
 		t.Fatalf("grpc.DialContext(_, %q, _) = %v", lis.Addr().String(), err)
 	}
-	client := testpb.NewTestServiceClient(cc)
+	client := testgrpc.NewTestServiceClient(cc)
 	defer cc.Close()
 
 	// 4. Send an RPC on the new connection.
 	// The server would send a GOAWAY first, but we are delaying the server's
 	// writes for now until the client writes more than the preface.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	if _, err = client.FullDuplexCall(ctx); err == nil || status.Code(err) != codes.Unavailable {
 		t.Fatalf("FullDuplexCall= _, %v; want _, <status code Unavailable>", err)
 	}
@@ -166,14 +168,15 @@ func (s) TestGracefulStop(t *testing.T) {
 	wg.Wait()
 }
 
+// TestGracefulStopClosesConnAfterLastStream ensures that a server closes the
+// connections to its clients when the final stream has completed after
+// a GOAWAY.
 func (s) TestGracefulStopClosesConnAfterLastStream(t *testing.T) {
-	// This test ensures that a server closes the connections to its clients
-	// when the final stream has completed after a GOAWAY.
 
 	handlerCalled := make(chan struct{})
 	gracefulStopCalled := make(chan struct{})
 
-	ts := &funcServer{streamingInputCall: func(stream testpb.TestService_StreamingInputCallServer) error {
+	ts := &funcServer{streamingInputCall: func(testgrpc.TestService_StreamingInputCallServer) error {
 		close(handlerCalled) // Initiate call to GracefulStop.
 		<-gracefulStopCalled // Wait for GOAWAYs to be received by the client.
 		return nil
@@ -214,4 +217,93 @@ func (s) TestGracefulStopClosesConnAfterLastStream(t *testing.T) {
 
 		<-gracefulStopDone // Wait for GracefulStop to return.
 	})
+}
+
+// TestGracefulStopBlocksUntilGRPCConnectionsTerminate ensures that
+// GracefulStop() blocks until all ongoing RPCs finished.
+func (s) TestGracefulStopBlocksUntilGRPCConnectionsTerminate(t *testing.T) {
+	unblockGRPCCall := make(chan struct{})
+	grpcCallExecuting := make(chan struct{})
+	ss := &stubserver.StubServer{
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			close(grpcCallExecuting)
+			<-unblockGRPCCall
+			return &testpb.SimpleResponse{}, nil
+		},
+	}
+
+	err := ss.Start(nil)
+	if err != nil {
+		t.Fatalf("StubServer.start failed: %s", err)
+	}
+	t.Cleanup(ss.Stop)
+
+	grpcClientCallReturned := make(chan struct{})
+	go func() {
+		clt := ss.Client
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+		defer cancel()
+		_, err := clt.UnaryCall(ctx, &testpb.SimpleRequest{})
+		if err != nil {
+			t.Errorf("rpc failed with error: %s", err)
+		}
+		close(grpcClientCallReturned)
+	}()
+
+	gracefulStopReturned := make(chan struct{})
+	<-grpcCallExecuting
+	go func() {
+		ss.S.GracefulStop()
+		close(gracefulStopReturned)
+	}()
+
+	select {
+	case <-gracefulStopReturned:
+		t.Error("GracefulStop returned before rpc method call ended")
+	case <-time.After(defaultTestShortTimeout):
+	}
+
+	unblockGRPCCall <- struct{}{}
+	<-grpcClientCallReturned
+	<-gracefulStopReturned
+}
+
+// TestStopAbortsBlockingGRPCCall ensures that when Stop() is called while an ongoing RPC
+// is blocking that:
+// - Stop() returns
+// - and the RPC fails with an connection  closed error on the client-side
+func (s) TestStopAbortsBlockingGRPCCall(t *testing.T) {
+	unblockGRPCCall := make(chan struct{})
+	grpcCallExecuting := make(chan struct{})
+	ss := &stubserver.StubServer{
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			close(grpcCallExecuting)
+			<-unblockGRPCCall
+			return &testpb.SimpleResponse{}, nil
+		},
+	}
+
+	err := ss.Start(nil)
+	if err != nil {
+		t.Fatalf("StubServer.start failed: %s", err)
+	}
+	t.Cleanup(ss.Stop)
+
+	grpcClientCallReturned := make(chan struct{})
+	go func() {
+		clt := ss.Client
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+		defer cancel()
+		_, err := clt.UnaryCall(ctx, &testpb.SimpleRequest{})
+		if err == nil || !isConnClosedErr(err) {
+			t.Errorf("expected rpc to fail with connection closed error, got: %v", err)
+		}
+		close(grpcClientCallReturned)
+	}()
+
+	<-grpcCallExecuting
+	ss.S.Stop()
+
+	unblockGRPCCall <- struct{}{}
+	<-grpcClientCallReturned
 }

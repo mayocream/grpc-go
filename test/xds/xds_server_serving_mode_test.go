@@ -27,15 +27,18 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	xdscreds "google.golang.org/grpc/credentials/xds"
+	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+	"google.golang.org/grpc/internal/testutils/xds/e2e/setup"
 	"google.golang.org/grpc/xds"
 
 	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
-	testgrpc "google.golang.org/grpc/test/grpc_testing"
-	testpb "google.golang.org/grpc/test/grpc_testing"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
 // TestServerSideXDS_RedundantUpdateSuppression tests the scenario where the
@@ -43,8 +46,7 @@ import (
 // change callback is not invoked and client connections to the server are not
 // recycled.
 func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
-	managementServer, nodeID, bootstrapContents, _, cleanup := e2e.SetupManagementServer(t, e2e.ManagementServerOptions{})
-	defer cleanup()
+	managementServer, nodeID, bootstrapContents, _ := setup.ManagementServerAndResolver(t)
 
 	creds, err := xdscreds.NewServerCredentials(xdscreds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
 	if err != nil {
@@ -62,17 +64,17 @@ func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
 		updateCh <- args.Mode
 	})
 
-	// Initialize an xDS-enabled gRPC server and register the stubServer on it.
-	server := xds.NewGRPCServer(grpc.Creds(creds), modeChangeOpt, xds.BootstrapContentsForTesting(bootstrapContents))
-	defer server.Stop()
-	testgrpc.RegisterTestServiceServer(server, &testService{})
+	// Initialize a test gRPC server, assign it to the stub server, and start
+	// the test service.
+	stub := createStubServer(t, lis, creds, modeChangeOpt, bootstrapContents)
+	defer stub.S.Stop()
 
 	// Setup the management server to respond with the listener resources.
 	host, port, err := hostPortFromListener(lis)
 	if err != nil {
 		t.Fatalf("failed to retrieve host and port of server: %v", err)
 	}
-	listener := e2e.DefaultServerListener(host, port, e2e.SecurityLevelNone)
+	listener := e2e.DefaultServerListener(host, port, e2e.SecurityLevelNone, "routeName")
 	resources := e2e.UpdateOptions{
 		NodeID:    nodeID,
 		Listeners: []*v3listenerpb.Listener{listener},
@@ -82,12 +84,6 @@ func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
 	if err := managementServer.Update(ctx, resources); err != nil {
 		t.Fatal(err)
 	}
-
-	go func() {
-		if err := server.Serve(lis); err != nil {
-			t.Errorf("Serve() failed: %v", err)
-		}
-	}()
 
 	// Wait for the listener to move to "serving" mode.
 	select {
@@ -100,7 +96,7 @@ func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
 	}
 
 	// Create a ClientConn and make a successful RPCs.
-	cc, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial local test server: %v", err)
 	}
@@ -163,8 +159,7 @@ func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
 // xDS enabled gRPC servers. It verifies that appropriate mode changes happen in
 // the server, and also verifies behavior of clientConns under these modes.
 func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
-	managementServer, nodeID, bootstrapContents, _, cleanup := e2e.SetupManagementServer(t, e2e.ManagementServerOptions{})
-	defer cleanup()
+	managementServer, nodeID, bootstrapContents, _ := setup.ManagementServerAndResolver(t)
 
 	// Configure xDS credentials to be used on the server-side.
 	creds, err := xdscreds.NewServerCredentials(xdscreds.ServerOptions{
@@ -204,10 +199,12 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 		}
 	})
 
-	// Initialize an xDS-enabled gRPC server and register the stubServer on it.
-	server := xds.NewGRPCServer(grpc.Creds(creds), modeChangeOpt, xds.BootstrapContentsForTesting(bootstrapContents))
-	defer server.Stop()
-	testpb.RegisterTestServiceServer(server, &testService{})
+	// Initialize a test gRPC server, assign it to the stub server, and start
+	// the test service.
+	stub1 := createStubServer(t, lis1, creds, modeChangeOpt, bootstrapContents)
+	defer stub1.S.Stop()
+	stub2 := createStubServer(t, lis2, creds, modeChangeOpt, bootstrapContents)
+	defer stub2.S.Stop()
 
 	// Setup the management server to respond with server-side Listener
 	// resources for both listeners.
@@ -215,12 +212,12 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to retrieve host and port of server: %v", err)
 	}
-	listener1 := e2e.DefaultServerListener(host1, port1, e2e.SecurityLevelNone)
+	listener1 := e2e.DefaultServerListener(host1, port1, e2e.SecurityLevelNone, "routeName")
 	host2, port2, err := hostPortFromListener(lis2)
 	if err != nil {
 		t.Fatalf("failed to retrieve host and port of server: %v", err)
 	}
-	listener2 := e2e.DefaultServerListener(host2, port2, e2e.SecurityLevelNone)
+	listener2 := e2e.DefaultServerListener(host2, port2, e2e.SecurityLevelNone, "routeName")
 	resources := e2e.UpdateOptions{
 		NodeID:    nodeID,
 		Listeners: []*v3listenerpb.Listener{listener1, listener2},
@@ -228,17 +225,6 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 	if err := managementServer.Update(ctx, resources); err != nil {
 		t.Fatal(err)
 	}
-
-	go func() {
-		if err := server.Serve(lis1); err != nil {
-			t.Errorf("Serve() failed: %v", err)
-		}
-	}()
-	go func() {
-		if err := server.Serve(lis2); err != nil {
-			t.Errorf("Serve() failed: %v", err)
-		}
-	}()
 
 	// Wait for both listeners to move to "serving" mode.
 	select {
@@ -259,7 +245,7 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 	}
 
 	// Create a ClientConn to the first listener and make a successful RPCs.
-	cc1, err := grpc.Dial(lis1.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc1, err := grpc.NewClient(lis1.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial local test server: %v", err)
 	}
@@ -267,7 +253,7 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 	waitForSuccessfulRPC(ctx, t, cc1)
 
 	// Create a ClientConn to the second listener and make a successful RPCs.
-	cc2, err := grpc.Dial(lis2.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc2, err := grpc.NewClient(lis2.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial local test server: %v", err)
 	}
@@ -362,6 +348,22 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 	waitForSuccessfulRPC(ctx, t, cc2)
 }
 
+func createStubServer(t *testing.T, lis net.Listener, creds credentials.TransportCredentials, modeChangeOpt grpc.ServerOption, bootstrapContents []byte) *stubserver.StubServer {
+	stub := &stubserver.StubServer{
+		Listener: lis,
+		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+			return &testpb.Empty{}, nil
+		},
+	}
+	server, err := xds.NewGRPCServer(grpc.Creds(creds), modeChangeOpt, xds.BootstrapContentsForTesting(bootstrapContents))
+	if err != nil {
+		t.Fatalf("Failed to create an xDS enabled gRPC server: %v", err)
+	}
+	stub.S = server
+	stubserver.StartTestService(t, stub)
+	return stub
+}
+
 func waitForSuccessfulRPC(ctx context.Context, t *testing.T, cc *grpc.ClientConn) {
 	t.Helper()
 
@@ -380,7 +382,7 @@ func waitForFailedRPC(ctx context.Context, t *testing.T, cc *grpc.ClientConn) {
 		return
 	}
 
-	ticker := time.NewTimer(1 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {

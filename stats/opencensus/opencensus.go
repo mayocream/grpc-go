@@ -88,7 +88,7 @@ func ServerOption(to TraceOptions) grpc.ServerOption {
 func (csh *clientStatsHandler) createCallSpan(ctx context.Context, method string) (context.Context, *trace.Span) {
 	var span *trace.Span
 	if !csh.to.DisableTrace {
-		mn := "Sent." + strings.Replace(removeLeadingSlash(method), "/", ".", -1)
+		mn := strings.ReplaceAll(removeLeadingSlash(method), "/", ".")
 		ctx, span = trace.StartSpan(ctx, mn, trace.WithSampler(csh.to.TS), trace.WithSpanKind(trace.SpanKindClient))
 	}
 	return ctx, span
@@ -104,7 +104,7 @@ func perCallTracesAndMetrics(err error, span *trace.Span, startTime time.Time, m
 	callLatency := float64(time.Since(startTime)) / float64(time.Millisecond)
 	ocstats.RecordWithOptions(context.Background(),
 		ocstats.WithTags(
-			tag.Upsert(keyClientMethod, method),
+			tag.Upsert(keyClientMethod, removeLeadingSlash(method)),
 			tag.Upsert(keyClientStatus, canonicalString(s.Code())),
 		),
 		ocstats.WithMeasurements(
@@ -116,7 +116,7 @@ func perCallTracesAndMetrics(err error, span *trace.Span, startTime time.Time, m
 // unaryInterceptor handles per RPC context management. It also handles per RPC
 // tracing and stats by creating a top level call span and recording the latency
 // for the full RPC call.
-func (csh *clientStatsHandler) unaryInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+func (csh *clientStatsHandler) unaryInterceptor(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 	startTime := time.Now()
 	ctx, span := csh.createCallSpan(ctx, method)
 	err := invoker(ctx, method, req, reply, cc, opts...)
@@ -152,11 +152,25 @@ func setRPCInfo(ctx context.Context, ri *rpcInfo) context.Context {
 	return context.WithValue(ctx, rpcInfoKey{}, ri)
 }
 
-// getSpanWithMsgCount returns the rpcInfo stored in the context, or nil
+// getRPCInfo returns the rpcInfo stored in the context, or nil
 // if there isn't one.
 func getRPCInfo(ctx context.Context) *rpcInfo {
 	ri, _ := ctx.Value(rpcInfoKey{}).(*rpcInfo)
 	return ri
+}
+
+// SpanContextFromContext returns the Span Context about the Span in the
+// context. Returns false if no Span in the context.
+func SpanContextFromContext(ctx context.Context) (trace.SpanContext, bool) {
+	ri, ok := ctx.Value(rpcInfoKey{}).(*rpcInfo)
+	if !ok {
+		return trace.SpanContext{}, false
+	}
+	if ri.ti == nil || ri.ti.span == nil {
+		return trace.SpanContext{}, false
+	}
+	sc := ri.ti.span.SpanContext()
+	return sc, true
 }
 
 type clientStatsHandler struct {
