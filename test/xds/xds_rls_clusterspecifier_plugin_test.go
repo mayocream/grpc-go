@@ -26,10 +26,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal"
-	"google.golang.org/grpc/internal/envconfig"
+	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/rls"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+	"google.golang.org/grpc/internal/testutils/xds/e2e/setup"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	v3clusterpb "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -37,15 +38,15 @@ import (
 	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	v3routepb "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	rlspb "google.golang.org/grpc/internal/proto/grpc_lookup_v1"
-	testgrpc "google.golang.org/grpc/test/grpc_testing"
-	testpb "google.golang.org/grpc/test/grpc_testing"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 
 	_ "google.golang.org/grpc/balancer/rls" // Register the RLS Load Balancing policy.
 )
 
 // defaultClientResourcesWithRLSCSP returns a set of resources (LDS, RDS, CDS, EDS) for a
 // client to connect to a server with a RLS Load Balancer as a child of Cluster Manager.
-func defaultClientResourcesWithRLSCSP(lb e2e.LoadBalancingPolicy, params e2e.ResourceParams, rlsProto *rlspb.RouteLookupConfig) e2e.UpdateOptions {
+func defaultClientResourcesWithRLSCSP(t *testing.T, lb e2e.LoadBalancingPolicy, params e2e.ResourceParams, rlsProto *rlspb.RouteLookupConfig) e2e.UpdateOptions {
 	routeConfigName := "route-" + params.DialTarget
 	clusterName := "cluster-" + params.DialTarget
 	endpointsName := "endpoints-" + params.DialTarget
@@ -57,11 +58,11 @@ func defaultClientResourcesWithRLSCSP(lb e2e.LoadBalancingPolicy, params e2e.Res
 			ListenerName:               params.DialTarget,
 			ClusterSpecifierType:       e2e.RouteConfigClusterSpecifierTypeClusterSpecifierPlugin,
 			ClusterSpecifierPluginName: "rls-csp",
-			ClusterSpecifierPluginConfig: testutils.MarshalAny(&rlspb.RouteLookupClusterSpecifier{
+			ClusterSpecifierPluginConfig: testutils.MarshalAny(t, &rlspb.RouteLookupClusterSpecifier{
 				RouteLookupConfig: rlsProto,
 			}),
 		})},
-		Clusters: []*v3clusterpb.Cluster{e2e.ClusterResourceWithOptions(&e2e.ClusterOptions{
+		Clusters: []*v3clusterpb.Cluster{e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
 			ClusterName:   clusterName,
 			ServiceName:   endpointsName,
 			Policy:        lb,
@@ -99,21 +100,16 @@ func (s) TestRLSinxDS(t *testing.T) {
 }
 
 func testRLSinxDS(t *testing.T, lbPolicy e2e.LoadBalancingPolicy) {
-	oldRLS := envconfig.XDSRLS
-	envconfig.XDSRLS = true
 	internal.RegisterRLSClusterSpecifierPluginForTesting()
-	defer func() {
-		envconfig.XDSRLS = oldRLS
-		internal.UnregisterRLSClusterSpecifierPluginForTesting()
-	}()
+	defer internal.UnregisterRLSClusterSpecifierPluginForTesting()
 
 	// Set up all components and configuration necessary - management server,
 	// xDS resolver, fake RLS Server, and xDS configuration which specifies an
 	// RLS Balancer that communicates to this set up fake RLS Server.
-	managementServer, nodeID, _, resolver, cleanup1 := e2e.SetupManagementServer(t, e2e.ManagementServerOptions{})
-	defer cleanup1()
-	port, cleanup2 := startTestService(t, nil)
-	defer cleanup2()
+	managementServer, nodeID, _, xdsResolver := setup.ManagementServerAndResolver(t)
+
+	server := stubserver.StartTestService(t, nil)
+	defer server.Stop()
 
 	lis := testutils.NewListenerWrapper(t, nil)
 	rlsServer, rlsRequestCh := rls.SetupFakeRLSServer(t, lis)
@@ -125,11 +121,11 @@ func testRLSinxDS(t *testing.T, lbPolicy e2e.LoadBalancingPolicy) {
 	}
 
 	const serviceName = "my-service-client-side-xds"
-	resources := defaultClientResourcesWithRLSCSP(lbPolicy, e2e.ResourceParams{
+	resources := defaultClientResourcesWithRLSCSP(t, lbPolicy, e2e.ResourceParams{
 		DialTarget: serviceName,
 		NodeID:     nodeID,
 		Host:       "localhost",
-		Port:       port,
+		Port:       testutils.ParsePort(t, server.Address),
 		SecLevel:   e2e.SecurityLevelNone,
 	}, rlsProto)
 
@@ -146,7 +142,7 @@ func testRLSinxDS(t *testing.T, lbPolicy e2e.LoadBalancingPolicy) {
 	})
 
 	// Create a ClientConn and make a successful RPC.
-	cc, err := grpc.Dial(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(resolver))
+	cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
 	if err != nil {
 		t.Fatalf("failed to dial local test server: %v", err)
 	}

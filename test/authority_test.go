@@ -29,7 +29,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -39,7 +38,9 @@ import (
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
-	testpb "google.golang.org/grpc/test/grpc_testing"
+
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
 func authorityChecker(ctx context.Context, expectedAuthority string) (*testpb.Empty, error) {
@@ -82,7 +83,7 @@ func runUnixTest(t *testing.T, address, target, expectedAuthority string, dialer
 		t.Fatalf("Error starting endpoint server: %v", err)
 	}
 	defer ss.Stop()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	_, err := ss.Client.EmptyCall(ctx, &testpb.Empty{})
 	if err != nil {
@@ -124,7 +125,7 @@ var authorityTests = []authorityTest{
 		name:           "UnixPassthrough",
 		address:        "/tmp/sock.sock",
 		target:         "passthrough:///unix:///tmp/sock.sock",
-		authority:      "unix:///tmp/sock.sock",
+		authority:      "unix:%2F%2F%2Ftmp%2Fsock.sock",
 		dialTargetWant: "unix:///tmp/sock.sock",
 	},
 	{
@@ -164,7 +165,7 @@ func (s) TestUnixCustomDialer(t *testing.T) {
 	}
 }
 
-// TestColonPortAuthority does an end to end test with the target for grpc.Dial
+// TestColonPortAuthority does an end to end test with the target for grpc.NewClient
 // being ":[port]". Ensures authority is "localhost:[port]".
 func (s) TestColonPortAuthority(t *testing.T) {
 	expectedAuthority := ""
@@ -188,28 +189,23 @@ func (s) TestColonPortAuthority(t *testing.T) {
 	authorityMu.Lock()
 	expectedAuthority = "localhost:" + port
 	authorityMu.Unlock()
-	// ss.Start dials, but not the ":[port]" target that is being tested here.
-	// Dial again, with ":[port]" as the target.
-	//
-	// Append "localhost" before calling net.Dial, in case net.Dial on certain
-	// platforms doesn't work well for address without the IP.
-	cc, err := grpc.Dial(":"+port, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "tcp", "localhost"+addr)
-	}))
+	// ss.Start dials the server, but we explicitly test with ":[port]"
+	// as the target.
+	cc, err := grpc.NewClient(":"+port, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%q) = %v", ss.Target, err)
+		t.Fatalf("grpc.NewClient(%q) = %v", ss.Target, err)
 	}
 	defer cc.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	_, err = testpb.NewTestServiceClient(cc).EmptyCall(ctx, &testpb.Empty{})
+	_, err = testgrpc.NewTestServiceClient(cc).EmptyCall(ctx, &testpb.Empty{})
 	if err != nil {
 		t.Errorf("us.client.EmptyCall(_, _) = _, %v; want _, nil", err)
 	}
 }
 
 // TestAuthorityReplacedWithResolverAddress tests the scenario where the resolver
-// returned address contains a ServerName override. The test verifies that the the
+// returned address contains a ServerName override. The test verifies that the
 // :authority header value sent to the server as part of the http/2 HEADERS frame
 // is set to the value specified in the resolver returned address.
 func (s) TestAuthorityReplacedWithResolverAddress(t *testing.T) {
@@ -227,15 +223,15 @@ func (s) TestAuthorityReplacedWithResolverAddress(t *testing.T) {
 
 	r := manual.NewBuilderWithScheme("whatever")
 	r.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: ss.Address, ServerName: expectedAuthority}}})
-	cc, err := grpc.Dial(r.Scheme()+":///whatever", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
+	cc, err := grpc.NewClient(r.Scheme()+":///whatever", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
 	if err != nil {
-		t.Fatalf("grpc.Dial(%q) = %v", ss.Address, err)
+		t.Fatalf("grpc.NewClient(%q) = %v", ss.Address, err)
 	}
 	defer cc.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	if _, err = testpb.NewTestServiceClient(cc).EmptyCall(ctx, &testpb.Empty{}); err != nil {
+	if _, err = testgrpc.NewTestServiceClient(cc).EmptyCall(ctx, &testpb.Empty{}); err != nil {
 		t.Fatalf("EmptyCall() rpc failed: %v", err)
 	}
 }

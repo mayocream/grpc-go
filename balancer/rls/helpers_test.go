@@ -28,18 +28,17 @@ import (
 	"google.golang.org/grpc/balancer/rls/internal/test/e2e"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/internal"
-	"google.golang.org/grpc/internal/balancergroup"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/grpctest"
 	rlspb "google.golang.org/grpc/internal/proto/grpc_lookup_v1"
 	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
 	"google.golang.org/grpc/internal/stubserver"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/status"
-	testgrpc "google.golang.org/grpc/test/grpc_testing"
-	testpb "google.golang.org/grpc/test/grpc_testing"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -47,10 +46,6 @@ const (
 	defaultTestTimeout      = 5 * time.Second
 	defaultTestShortTimeout = 100 * time.Millisecond
 )
-
-func init() {
-	balancergroup.DefaultSubBalancerCloseTimeout = time.Millisecond
-}
 
 type s struct {
 	grpctest.Tester
@@ -66,7 +61,7 @@ type fakeBackoffStrategy struct {
 	backoff time.Duration
 }
 
-func (f *fakeBackoffStrategy) Backoff(retries int) time.Duration {
+func (f *fakeBackoffStrategy) Backoff(int) time.Duration {
 	return f.backoff
 }
 
@@ -176,7 +171,7 @@ func startBackend(t *testing.T, sopts ...grpc.ServerOption) (rpcCh chan struct{}
 
 	rpcCh = make(chan struct{}, 1)
 	backend := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
 			select {
 			case rpcCh <- struct{}{}:
 			default:

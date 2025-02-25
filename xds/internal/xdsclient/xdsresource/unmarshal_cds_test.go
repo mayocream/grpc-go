@@ -18,29 +18,34 @@
 package xdsresource
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 
-	v3discoverypb "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/pretty"
 	"google.golang.org/grpc/internal/testutils"
+	"google.golang.org/grpc/internal/xds/bootstrap"
 	"google.golang.org/grpc/internal/xds/matcher"
+	"google.golang.org/grpc/xds/internal"
 	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource/version"
-	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	v3clusterpb "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	v3endpointpb "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	v3aggregateclusterpb "github.com/envoyproxy/go-control-plane/envoy/extensions/clusters/aggregate/v3"
+	v3leastrequestpb "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/least_request/v3"
+	v3ringhashpb "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/ring_hash/v3"
 	v3tlspb "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	v3discoverypb "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	v3matcherpb "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
-	anypb "github.com/golang/protobuf/ptypes/any"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 const (
@@ -48,14 +53,11 @@ const (
 	serviceName = "service"
 )
 
-var emptyUpdate = ClusterUpdate{ClusterName: clusterName, LRSServerConfig: ClusterLRSOff}
-
 func (s) TestValidateCluster_Failure(t *testing.T) {
 	tests := []struct {
-		name       string
-		cluster    *v3clusterpb.Cluster
-		wantUpdate ClusterUpdate
-		wantErr    bool
+		name    string
+		cluster *v3clusterpb.Cluster
+		wantErr bool
 	}{
 		{
 			name: "non-supported-cluster-type-static",
@@ -70,8 +72,7 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 				},
 				LbPolicy: v3clusterpb.Cluster_LEAST_REQUEST,
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 		{
 			name: "non-supported-cluster-type-original-dst",
@@ -86,8 +87,7 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 				},
 				LbPolicy: v3clusterpb.Cluster_LEAST_REQUEST,
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 		{
 			name: "no-eds-config",
@@ -95,8 +95,7 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
 				LbPolicy:             v3clusterpb.Cluster_ROUND_ROBIN,
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 		{
 			name: "no-ads-config-source",
@@ -105,8 +104,7 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 				EdsClusterConfig:     &v3clusterpb.Cluster_EdsClusterConfig{},
 				LbPolicy:             v3clusterpb.Cluster_ROUND_ROBIN,
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 		{
 			name: "non-round-robin-or-ring-hash-lb-policy",
@@ -121,8 +119,7 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 				},
 				LbPolicy: v3clusterpb.Cluster_LEAST_REQUEST,
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 		{
 			name: "logical-dns-multiple-localities",
@@ -138,8 +135,7 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 					},
 				},
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 		{
 			name: "ring-hash-hash-function-not-xx-hash",
@@ -151,35 +147,19 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 					},
 				},
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 		{
-			name: "ring-hash-min-bound-greater-than-max",
+			name: "least-request-choice-count-less-than-two",
 			cluster: &v3clusterpb.Cluster{
 				LbPolicy: v3clusterpb.Cluster_RING_HASH,
-				LbConfig: &v3clusterpb.Cluster_RingHashLbConfig_{
-					RingHashLbConfig: &v3clusterpb.Cluster_RingHashLbConfig{
-						MinimumRingSize: wrapperspb.UInt64(100),
-						MaximumRingSize: wrapperspb.UInt64(10),
+				LbConfig: &v3clusterpb.Cluster_LeastRequestLbConfig_{
+					LeastRequestLbConfig: &v3clusterpb.Cluster_LeastRequestLbConfig{
+						ChoiceCount: wrapperspb.UInt32(1),
 					},
 				},
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
-		},
-		{
-			name: "ring-hash-min-bound-greater-than-upper-bound",
-			cluster: &v3clusterpb.Cluster{
-				LbPolicy: v3clusterpb.Cluster_RING_HASH,
-				LbConfig: &v3clusterpb.Cluster_RingHashLbConfig_{
-					RingHashLbConfig: &v3clusterpb.Cluster_RingHashLbConfig{
-						MinimumRingSize: wrapperspb.UInt64(ringHashSizeUpperBound + 1),
-					},
-				},
-			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 		{
 			name: "ring-hash-max-bound-greater-than-upper-bound",
@@ -191,8 +171,61 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 					},
 				},
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
+		},
+		{
+			name: "ring-hash-max-bound-greater-than-upper-bound-load-balancing-policy",
+			cluster: &v3clusterpb.Cluster{
+				Name:                 clusterName,
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: serviceName,
+				},
+				LoadBalancingPolicy: &v3clusterpb.LoadBalancingPolicy{
+					Policies: []*v3clusterpb.LoadBalancingPolicy_Policy{
+						{
+							TypedExtensionConfig: &v3corepb.TypedExtensionConfig{
+								TypedConfig: testutils.MarshalAny(t, &v3ringhashpb.RingHash{
+									HashFunction:    v3ringhashpb.RingHash_XX_HASH,
+									MinimumRingSize: wrapperspb.UInt64(10),
+									MaximumRingSize: wrapperspb.UInt64(ringHashSizeUpperBound + 1),
+								}),
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "least-request-unsupported-in-converter-since-env-var-unset",
+			cluster: &v3clusterpb.Cluster{
+				Name:                 clusterName,
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: serviceName,
+				},
+				LoadBalancingPolicy: &v3clusterpb.LoadBalancingPolicy{
+					Policies: []*v3clusterpb.LoadBalancingPolicy_Policy{
+						{
+							TypedExtensionConfig: &v3corepb.TypedExtensionConfig{
+								TypedConfig: testutils.MarshalAny(t, &v3leastrequestpb.LeastRequest{}),
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
 		},
 		{
 			name: "aggregate-nil-clusters",
@@ -201,13 +234,12 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 				ClusterDiscoveryType: &v3clusterpb.Cluster_ClusterType{
 					ClusterType: &v3clusterpb.Cluster_CustomClusterType{
 						Name:        "envoy.clusters.aggregate",
-						TypedConfig: testutils.MarshalAny(&v3aggregateclusterpb.ClusterConfig{}),
+						TypedConfig: testutils.MarshalAny(t, &v3aggregateclusterpb.ClusterConfig{}),
 					},
 				},
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 		{
 			name: "aggregate-empty-clusters",
@@ -216,311 +248,33 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 				ClusterDiscoveryType: &v3clusterpb.Cluster_ClusterType{
 					ClusterType: &v3clusterpb.Cluster_CustomClusterType{
 						Name: "envoy.clusters.aggregate",
-						TypedConfig: testutils.MarshalAny(&v3aggregateclusterpb.ClusterConfig{
+						TypedConfig: testutils.MarshalAny(t, &v3aggregateclusterpb.ClusterConfig{
 							Clusters: []string{},
 						}),
 					},
 				},
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 			},
-			wantUpdate: emptyUpdate,
-			wantErr:    true,
+			wantErr: true,
 		},
 	}
 
-	oldAggregateAndDNSSupportEnv := envconfig.XDSAggregateAndDNS
-	envconfig.XDSAggregateAndDNS = true
-	defer func() { envconfig.XDSAggregateAndDNS = oldAggregateAndDNSSupportEnv }()
-	oldRingHashSupport := envconfig.XDSRingHash
-	envconfig.XDSRingHash = true
-	defer func() { envconfig.XDSRingHash = oldRingHashSupport }()
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if update, err := validateClusterAndConstructClusterUpdate(test.cluster); err == nil {
+			if update, err := validateClusterAndConstructClusterUpdate(test.cluster, nil); err == nil {
 				t.Errorf("validateClusterAndConstructClusterUpdate(%+v) = %v, wanted error", test.cluster, update)
 			}
 		})
 	}
 }
 
-func (s) TestValidateCluster_Success(t *testing.T) {
-	tests := []struct {
-		name       string
-		cluster    *v3clusterpb.Cluster
-		wantUpdate ClusterUpdate
-	}{
-		{
-			name: "happy-case-logical-dns",
-			cluster: &v3clusterpb.Cluster{
-				Name:                 clusterName,
-				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_LOGICAL_DNS},
-				LbPolicy:             v3clusterpb.Cluster_ROUND_ROBIN,
-				LoadAssignment: &v3endpointpb.ClusterLoadAssignment{
-					Endpoints: []*v3endpointpb.LocalityLbEndpoints{{
-						LbEndpoints: []*v3endpointpb.LbEndpoint{{
-							HostIdentifier: &v3endpointpb.LbEndpoint_Endpoint{
-								Endpoint: &v3endpointpb.Endpoint{
-									Address: &v3corepb.Address{
-										Address: &v3corepb.Address_SocketAddress{
-											SocketAddress: &v3corepb.SocketAddress{
-												Address: "dns_host",
-												PortSpecifier: &v3corepb.SocketAddress_PortValue{
-													PortValue: 8080,
-												},
-											},
-										},
-									},
-								},
-							},
-						}},
-					}},
-				},
-			},
-			wantUpdate: ClusterUpdate{
-				ClusterName: clusterName,
-				ClusterType: ClusterTypeLogicalDNS,
-				DNSHostName: "dns_host:8080",
-			},
-		},
-		{
-			name: "happy-case-aggregate-v3",
-			cluster: &v3clusterpb.Cluster{
-				Name: clusterName,
-				ClusterDiscoveryType: &v3clusterpb.Cluster_ClusterType{
-					ClusterType: &v3clusterpb.Cluster_CustomClusterType{
-						Name: "envoy.clusters.aggregate",
-						TypedConfig: testutils.MarshalAny(&v3aggregateclusterpb.ClusterConfig{
-							Clusters: []string{"a", "b", "c"},
-						}),
-					},
-				},
-				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
-			},
-			wantUpdate: ClusterUpdate{
-				ClusterName: clusterName, LRSServerConfig: ClusterLRSOff, ClusterType: ClusterTypeAggregate,
-				PrioritizedClusterNames: []string{"a", "b", "c"},
-			},
-		},
-		{
-			name: "happy-case-no-service-name-no-lrs",
-			cluster: &v3clusterpb.Cluster{
-				Name:                 clusterName,
-				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
-				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
-					EdsConfig: &v3corepb.ConfigSource{
-						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
-							Ads: &v3corepb.AggregatedConfigSource{},
-						},
-					},
-				},
-				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
-			},
-			wantUpdate: emptyUpdate,
-		},
-		{
-			name: "happy-case-no-lrs",
-			cluster: &v3clusterpb.Cluster{
-				Name:                 clusterName,
-				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
-				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
-					EdsConfig: &v3corepb.ConfigSource{
-						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
-							Ads: &v3corepb.AggregatedConfigSource{},
-						},
-					},
-					ServiceName: serviceName,
-				},
-				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
-			},
-			wantUpdate: ClusterUpdate{ClusterName: clusterName, EDSServiceName: serviceName, LRSServerConfig: ClusterLRSOff},
-		},
-		{
-			name: "happiest-case",
-			cluster: &v3clusterpb.Cluster{
-				Name:                 clusterName,
-				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
-				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
-					EdsConfig: &v3corepb.ConfigSource{
-						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
-							Ads: &v3corepb.AggregatedConfigSource{},
-						},
-					},
-					ServiceName: serviceName,
-				},
-				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
-				LrsServer: &v3corepb.ConfigSource{
-					ConfigSourceSpecifier: &v3corepb.ConfigSource_Self{
-						Self: &v3corepb.SelfConfigSource{},
-					},
-				},
-			},
-			wantUpdate: ClusterUpdate{ClusterName: clusterName, EDSServiceName: serviceName, LRSServerConfig: ClusterLRSServerSelf},
-		},
-		{
-			name: "happiest-case-with-circuitbreakers",
-			cluster: &v3clusterpb.Cluster{
-				Name:                 clusterName,
-				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
-				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
-					EdsConfig: &v3corepb.ConfigSource{
-						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
-							Ads: &v3corepb.AggregatedConfigSource{},
-						},
-					},
-					ServiceName: serviceName,
-				},
-				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
-				CircuitBreakers: &v3clusterpb.CircuitBreakers{
-					Thresholds: []*v3clusterpb.CircuitBreakers_Thresholds{
-						{
-							Priority:    v3corepb.RoutingPriority_DEFAULT,
-							MaxRequests: wrapperspb.UInt32(512),
-						},
-						{
-							Priority:    v3corepb.RoutingPriority_HIGH,
-							MaxRequests: nil,
-						},
-					},
-				},
-				LrsServer: &v3corepb.ConfigSource{
-					ConfigSourceSpecifier: &v3corepb.ConfigSource_Self{
-						Self: &v3corepb.SelfConfigSource{},
-					},
-				},
-			},
-			wantUpdate: ClusterUpdate{ClusterName: clusterName, EDSServiceName: serviceName, LRSServerConfig: ClusterLRSServerSelf, MaxRequests: func() *uint32 { i := uint32(512); return &i }()},
-		},
-		{
-			name: "happiest-case-with-ring-hash-lb-policy-with-default-config",
-			cluster: &v3clusterpb.Cluster{
-				Name:                 clusterName,
-				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
-				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
-					EdsConfig: &v3corepb.ConfigSource{
-						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
-							Ads: &v3corepb.AggregatedConfigSource{},
-						},
-					},
-					ServiceName: serviceName,
-				},
-				LbPolicy: v3clusterpb.Cluster_RING_HASH,
-				LrsServer: &v3corepb.ConfigSource{
-					ConfigSourceSpecifier: &v3corepb.ConfigSource_Self{
-						Self: &v3corepb.SelfConfigSource{},
-					},
-				},
-			},
-			wantUpdate: ClusterUpdate{
-				ClusterName: clusterName, EDSServiceName: serviceName, LRSServerConfig: ClusterLRSServerSelf,
-				LBPolicy: &ClusterLBPolicyRingHash{MinimumRingSize: defaultRingHashMinSize, MaximumRingSize: defaultRingHashMaxSize},
-			},
-		},
-		{
-			name: "happiest-case-with-ring-hash-lb-policy-with-none-default-config",
-			cluster: &v3clusterpb.Cluster{
-				Name:                 clusterName,
-				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
-				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
-					EdsConfig: &v3corepb.ConfigSource{
-						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
-							Ads: &v3corepb.AggregatedConfigSource{},
-						},
-					},
-					ServiceName: serviceName,
-				},
-				LbPolicy: v3clusterpb.Cluster_RING_HASH,
-				LbConfig: &v3clusterpb.Cluster_RingHashLbConfig_{
-					RingHashLbConfig: &v3clusterpb.Cluster_RingHashLbConfig{
-						MinimumRingSize: wrapperspb.UInt64(10),
-						MaximumRingSize: wrapperspb.UInt64(100),
-					},
-				},
-				LrsServer: &v3corepb.ConfigSource{
-					ConfigSourceSpecifier: &v3corepb.ConfigSource_Self{
-						Self: &v3corepb.SelfConfigSource{},
-					},
-				},
-			},
-			wantUpdate: ClusterUpdate{
-				ClusterName: clusterName, EDSServiceName: serviceName, LRSServerConfig: ClusterLRSServerSelf,
-				LBPolicy: &ClusterLBPolicyRingHash{MinimumRingSize: 10, MaximumRingSize: 100},
-			},
-		},
-	}
-
-	oldAggregateAndDNSSupportEnv := envconfig.XDSAggregateAndDNS
-	envconfig.XDSAggregateAndDNS = true
-	defer func() { envconfig.XDSAggregateAndDNS = oldAggregateAndDNSSupportEnv }()
-	oldRingHashSupport := envconfig.XDSRingHash
-	envconfig.XDSRingHash = true
-	defer func() { envconfig.XDSRingHash = oldRingHashSupport }()
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			update, err := validateClusterAndConstructClusterUpdate(test.cluster)
-			if err != nil {
-				t.Errorf("validateClusterAndConstructClusterUpdate(%+v) failed: %v", test.cluster, err)
-			}
-			if diff := cmp.Diff(update, test.wantUpdate, cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("validateClusterAndConstructClusterUpdate(%+v) got diff: %v (-got, +want)", test.cluster, diff)
-			}
-		})
-	}
-}
-
-func (s) TestValidateClusterWithSecurityConfig_EnvVarOff(t *testing.T) {
-	// Turn off the env var protection for client-side security.
-	origClientSideSecurityEnvVar := envconfig.XDSClientSideSecurity
-	envconfig.XDSClientSideSecurity = false
-	defer func() { envconfig.XDSClientSideSecurity = origClientSideSecurityEnvVar }()
-
-	cluster := &v3clusterpb.Cluster{
-		Name:                 clusterName,
-		ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
-		EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
-			EdsConfig: &v3corepb.ConfigSource{
-				ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
-					Ads: &v3corepb.AggregatedConfigSource{},
-				},
-			},
-			ServiceName: serviceName,
-		},
-		LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
-		TransportSocket: &v3corepb.TransportSocket{
-			Name: "envoy.transport_sockets.tls",
-			ConfigType: &v3corepb.TransportSocket_TypedConfig{
-				TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
-					CommonTlsContext: &v3tlspb.CommonTlsContext{
-						ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContextCertificateProviderInstance{
-							ValidationContextCertificateProviderInstance: &v3tlspb.CommonTlsContext_CertificateProviderInstance{
-								InstanceName:    "rootInstance",
-								CertificateName: "rootCert",
-							},
-						},
-					},
-				}),
-			},
-		},
-	}
-	wantUpdate := ClusterUpdate{
-		ClusterName:     clusterName,
-		EDSServiceName:  serviceName,
-		LRSServerConfig: ClusterLRSOff,
-	}
-	gotUpdate, err := validateClusterAndConstructClusterUpdate(cluster)
-	if err != nil {
-		t.Errorf("validateClusterAndConstructClusterUpdate() failed: %v", err)
-	}
-	if diff := cmp.Diff(wantUpdate, gotUpdate); diff != "" {
-		t.Errorf("validateClusterAndConstructClusterUpdate() returned unexpected diff (-want, got):\n%s", diff)
-	}
-}
-
 func (s) TestSecurityConfigFromCommonTLSContextUsingNewFields_ErrorCases(t *testing.T) {
 	tests := []struct {
-		name    string
-		common  *v3tlspb.CommonTlsContext
-		server  bool
-		wantErr string
+		name                      string
+		common                    *v3tlspb.CommonTlsContext
+		server                    bool
+		wantErr                   string
+		enableSystemRootCertsFlag bool
 	}{
 		{
 			name: "unsupported-tls_certificates-field-for-identity-certs",
@@ -603,7 +357,7 @@ func (s) TestSecurityConfigFromCommonTLSContextUsingNewFields_ErrorCases(t *test
 					},
 				},
 			},
-			wantErr: "unsupported require_sugned_ceritificate_timestamp field in CommonTlsContext message",
+			wantErr: "unsupported require_signed_certificate_timestamp field in CommonTlsContext message",
 		},
 		{
 			name: "unsupported-field-crl-in-validation-context",
@@ -670,10 +424,68 @@ func (s) TestSecurityConfigFromCommonTLSContextUsingNewFields_ErrorCases(t *test
 			server:  true,
 			wantErr: "match_subject_alt_names field in validation context is not supported on the server",
 		},
+		{
+			name:                      "client-missing-root-cert-provider-and-use-system-certs-fields",
+			enableSystemRootCertsFlag: true,
+			common: &v3tlspb.CommonTlsContext{
+				ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContext{
+					ValidationContext: &v3tlspb.CertificateValidationContext{},
+				},
+			},
+			wantErr: "expected fields ca_certificate_provider_instance and system_root_certs are missing",
+		},
+		{
+			name:                      "server-missing-root-cert-provider-and-use-system-certs-fields",
+			enableSystemRootCertsFlag: true,
+			common: &v3tlspb.CommonTlsContext{
+				ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContext{
+					ValidationContext: &v3tlspb.CertificateValidationContext{},
+				},
+			},
+			server:  true,
+			wantErr: "expected field ca_certificate_provider_instance is missing",
+		},
+		{
+			name: "client-missing-root-cert-provider-and-use-system-certs-fields-env-var-unset",
+			common: &v3tlspb.CommonTlsContext{
+				ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContext{
+					ValidationContext: &v3tlspb.CertificateValidationContext{},
+				},
+			},
+			wantErr: "expected field ca_certificate_provider_instance is missing",
+		},
+		{
+			name: "server-missing-root-cert-provider-and-use-system-certs-fields-env-var-unset",
+			common: &v3tlspb.CommonTlsContext{
+				ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContext{
+					ValidationContext: &v3tlspb.CertificateValidationContext{},
+				},
+			},
+			server:  true,
+			wantErr: "expected field ca_certificate_provider_instance is missing",
+		},
+		{
+			name:                      "server-missing-root-cert-provider-and-set-use-system-certs-fields",
+			enableSystemRootCertsFlag: true,
+			common: &v3tlspb.CommonTlsContext{
+				ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContext{
+					ValidationContext: &v3tlspb.CertificateValidationContext{
+						SystemRootCerts: &v3tlspb.CertificateValidationContext_SystemRootCerts{},
+					},
+				},
+			},
+			server:  true,
+			wantErr: "expected field ca_certificate_provider_instance is missing and unexpected field system_root_certs is set",
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			origFlag := envconfig.XDSSystemRootCertsEnabled
+			defer func() {
+				envconfig.XDSSystemRootCertsEnabled = origFlag
+			}()
+			envconfig.XDSSystemRootCertsEnabled = test.enableSystemRootCertsFlag
 			_, err := securityConfigFromCommonTLSContextUsingNewFields(test.common, test.server)
 			if err == nil {
 				t.Fatal("securityConfigFromCommonTLSContextUsingNewFields() succeeded when expected to fail")
@@ -703,10 +515,11 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 	var sanRE = regexp.MustCompile(sanRegexGood)
 
 	tests := []struct {
-		name       string
-		cluster    *v3clusterpb.Cluster
-		wantUpdate ClusterUpdate
-		wantErr    bool
+		name                      string
+		cluster                   *v3clusterpb.Cluster
+		wantUpdate                ClusterUpdate
+		wantErr                   bool
+		enableSystemRootCertsFlag bool
 	}{
 		{
 			name: "transport-socket-matches",
@@ -813,7 +626,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								TlsParams: &v3tlspb.TlsParameters{},
 							},
@@ -838,7 +651,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								CustomHandshaker: &v3corepb.TypedExtensionConfig{},
 							},
@@ -863,7 +676,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContextSdsSecretConfig{
 									ValidationContextSdsSecretConfig: &v3tlspb.SdsSecretConfig{
@@ -892,7 +705,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{},
 						}),
 					},
@@ -915,7 +728,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								ValidationContextType: &v3tlspb.CommonTlsContext_CombinedValidationContext{
 									CombinedValidationContext: &v3tlspb.CommonTlsContext_CombinedCertificateValidationContext{
@@ -952,7 +765,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								ValidationContextType: &v3tlspb.CommonTlsContext_CombinedValidationContext{
 									CombinedValidationContext: &v3tlspb.CommonTlsContext_CombinedCertificateValidationContext{
@@ -989,7 +802,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								ValidationContextType: &v3tlspb.CommonTlsContext_CombinedValidationContext{
 									CombinedValidationContext: &v3tlspb.CommonTlsContext_CombinedCertificateValidationContext{
@@ -1026,7 +839,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								ValidationContextType: &v3tlspb.CommonTlsContext_CombinedValidationContext{
 									CombinedValidationContext: &v3tlspb.CommonTlsContext_CombinedCertificateValidationContext{
@@ -1063,7 +876,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								ValidationContextType: &v3tlspb.CommonTlsContext_CombinedValidationContext{
 									CombinedValidationContext: &v3tlspb.CommonTlsContext_CombinedCertificateValidationContext{
@@ -1102,7 +915,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				TransportSocket: &v3corepb.TransportSocket{
 					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContextCertificateProviderInstance{
 									ValidationContextCertificateProviderInstance: &v3tlspb.CommonTlsContext_CertificateProviderInstance{
@@ -1116,13 +929,13 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				},
 			},
 			wantUpdate: ClusterUpdate{
-				ClusterName:     clusterName,
-				EDSServiceName:  serviceName,
-				LRSServerConfig: ClusterLRSOff,
+				ClusterName:    clusterName,
+				EDSServiceName: serviceName,
 				SecurityCfg: &SecurityConfig{
 					RootInstanceName: rootPluginInstance,
 					RootCertName:     rootCertName,
 				},
+				TelemetryLabels: internal.UnknownCSMLabels,
 			},
 		},
 		{
@@ -1142,7 +955,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				TransportSocket: &v3corepb.TransportSocket{
 					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContext{
 									ValidationContext: &v3tlspb.CertificateValidationContext{
@@ -1158,13 +971,13 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				},
 			},
 			wantUpdate: ClusterUpdate{
-				ClusterName:     clusterName,
-				EDSServiceName:  serviceName,
-				LRSServerConfig: ClusterLRSOff,
+				ClusterName:    clusterName,
+				EDSServiceName: serviceName,
 				SecurityCfg: &SecurityConfig{
 					RootInstanceName: rootPluginInstance,
 					RootCertName:     rootCertName,
 				},
+				TelemetryLabels: internal.UnknownCSMLabels,
 			},
 		},
 		{
@@ -1184,7 +997,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				TransportSocket: &v3corepb.TransportSocket{
 					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								TlsCertificateCertificateProviderInstance: &v3tlspb.CommonTlsContext_CertificateProviderInstance{
 									InstanceName:    identityPluginInstance,
@@ -1202,19 +1015,20 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				},
 			},
 			wantUpdate: ClusterUpdate{
-				ClusterName:     clusterName,
-				EDSServiceName:  serviceName,
-				LRSServerConfig: ClusterLRSOff,
+				ClusterName:    clusterName,
+				EDSServiceName: serviceName,
 				SecurityCfg: &SecurityConfig{
 					RootInstanceName:     rootPluginInstance,
 					RootCertName:         rootCertName,
 					IdentityInstanceName: identityPluginInstance,
 					IdentityCertName:     identityCertName,
 				},
+				TelemetryLabels: internal.UnknownCSMLabels,
 			},
 		},
 		{
-			name: "happy-case-with-validation-context-provider-instance-using-new-fields",
+			name:                      "happy-case-with-validation-context-provider-instance-using-new-fields",
+			enableSystemRootCertsFlag: true,
 			cluster: &v3clusterpb.Cluster{
 				Name:                 clusterName,
 				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
@@ -1230,7 +1044,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				TransportSocket: &v3corepb.TransportSocket{
 					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								TlsCertificateProviderInstance: &v3tlspb.CertificateProviderPluginInstance{
 									InstanceName:    identityPluginInstance,
@@ -1242,6 +1056,10 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 											InstanceName:    rootPluginInstance,
 											CertificateName: rootCertName,
 										},
+										// SystemRootCerts will be ignored due
+										// to the presence of
+										// CaCertificateProviderInstance.
+										SystemRootCerts: &v3tlspb.CertificateValidationContext_SystemRootCerts{},
 									},
 								},
 							},
@@ -1250,16 +1068,96 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				},
 			},
 			wantUpdate: ClusterUpdate{
-				ClusterName:     clusterName,
-				EDSServiceName:  serviceName,
-				LRSServerConfig: ClusterLRSOff,
+				ClusterName:    clusterName,
+				EDSServiceName: serviceName,
 				SecurityCfg: &SecurityConfig{
 					RootInstanceName:     rootPluginInstance,
 					RootCertName:         rootCertName,
 					IdentityInstanceName: identityPluginInstance,
 					IdentityCertName:     identityCertName,
 				},
+				TelemetryLabels: internal.UnknownCSMLabels,
 			},
+		},
+		{
+			name:                      "happy-case-with-validation-context-provider-instance-using-new-fields-and-system-root-certs",
+			enableSystemRootCertsFlag: true,
+			cluster: &v3clusterpb.Cluster{
+				Name:                 clusterName,
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: serviceName,
+				},
+				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+				TransportSocket: &v3corepb.TransportSocket{
+					Name: "envoy.transport_sockets.tls",
+					ConfigType: &v3corepb.TransportSocket_TypedConfig{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
+							CommonTlsContext: &v3tlspb.CommonTlsContext{
+								TlsCertificateProviderInstance: &v3tlspb.CertificateProviderPluginInstance{
+									InstanceName:    identityPluginInstance,
+									CertificateName: identityCertName,
+								},
+								ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContext{
+									ValidationContext: &v3tlspb.CertificateValidationContext{
+										SystemRootCerts: &v3tlspb.CertificateValidationContext_SystemRootCerts{},
+									},
+								},
+							},
+						}),
+					},
+				},
+			},
+			wantUpdate: ClusterUpdate{
+				ClusterName:    clusterName,
+				EDSServiceName: serviceName,
+				SecurityCfg: &SecurityConfig{
+					UseSystemRootCerts:   true,
+					IdentityInstanceName: identityPluginInstance,
+					IdentityCertName:     identityCertName,
+				},
+				TelemetryLabels: internal.UnknownCSMLabels,
+			},
+		},
+		{
+			name: "failure-case-with-validation-context-provider-instance-using-new-fields-and-system-root-certs-env-flag-disabled",
+			cluster: &v3clusterpb.Cluster{
+				Name:                 clusterName,
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: serviceName,
+				},
+				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+				TransportSocket: &v3corepb.TransportSocket{
+					Name: "envoy.transport_sockets.tls",
+					ConfigType: &v3corepb.TransportSocket_TypedConfig{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
+							CommonTlsContext: &v3tlspb.CommonTlsContext{
+								TlsCertificateProviderInstance: &v3tlspb.CertificateProviderPluginInstance{
+									InstanceName:    identityPluginInstance,
+									CertificateName: identityCertName,
+								},
+								ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContext{
+									ValidationContext: &v3tlspb.CertificateValidationContext{
+										SystemRootCerts: &v3tlspb.CertificateValidationContext_SystemRootCerts{},
+									},
+								},
+							},
+						}),
+					},
+				},
+			},
+			wantErr: true,
 		},
 		{
 			name: "happy-case-with-combined-validation-context-using-deprecated-fields",
@@ -1278,7 +1176,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				TransportSocket: &v3corepb.TransportSocket{
 					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								TlsCertificateCertificateProviderInstance: &v3tlspb.CommonTlsContext_CertificateProviderInstance{
 									InstanceName:    identityPluginInstance,
@@ -1310,9 +1208,8 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				},
 			},
 			wantUpdate: ClusterUpdate{
-				ClusterName:     clusterName,
-				EDSServiceName:  serviceName,
-				LRSServerConfig: ClusterLRSOff,
+				ClusterName:    clusterName,
+				EDSServiceName: serviceName,
 				SecurityCfg: &SecurityConfig{
 					RootInstanceName:     rootPluginInstance,
 					RootCertName:         rootCertName,
@@ -1326,6 +1223,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 						matcher.StringMatcherForTesting(nil, nil, nil, newStringP(sanContains), nil, false),
 					},
 				},
+				TelemetryLabels: internal.UnknownCSMLabels,
 			},
 		},
 		{
@@ -1345,7 +1243,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				TransportSocket: &v3corepb.TransportSocket{
 					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: testutils.MarshalAny(&v3tlspb.UpstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								TlsCertificateProviderInstance: &v3tlspb.CertificateProviderPluginInstance{
 									InstanceName:    identityPluginInstance,
@@ -1377,9 +1275,8 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				},
 			},
 			wantUpdate: ClusterUpdate{
-				ClusterName:     clusterName,
-				EDSServiceName:  serviceName,
-				LRSServerConfig: ClusterLRSOff,
+				ClusterName:    clusterName,
+				EDSServiceName: serviceName,
 				SecurityCfg: &SecurityConfig{
 					RootInstanceName:     rootPluginInstance,
 					RootCertName:         rootCertName,
@@ -1393,17 +1290,87 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 						matcher.StringMatcherForTesting(nil, nil, nil, newStringP(sanContains), nil, false),
 					},
 				},
+				TelemetryLabels: internal.UnknownCSMLabels,
+			},
+		},
+		{
+			name:                      "happy-case-with-combined-validation-context-using-new-fields-and-system-root-certs",
+			enableSystemRootCertsFlag: true,
+			cluster: &v3clusterpb.Cluster{
+				Name:                 clusterName,
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: serviceName,
+				},
+				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+				TransportSocket: &v3corepb.TransportSocket{
+					Name: "envoy.transport_sockets.tls",
+					ConfigType: &v3corepb.TransportSocket_TypedConfig{
+						TypedConfig: testutils.MarshalAny(t, &v3tlspb.UpstreamTlsContext{
+							CommonTlsContext: &v3tlspb.CommonTlsContext{
+								TlsCertificateProviderInstance: &v3tlspb.CertificateProviderPluginInstance{
+									InstanceName:    identityPluginInstance,
+									CertificateName: identityCertName,
+								},
+								ValidationContextType: &v3tlspb.CommonTlsContext_CombinedValidationContext{
+									CombinedValidationContext: &v3tlspb.CommonTlsContext_CombinedCertificateValidationContext{
+										DefaultValidationContext: &v3tlspb.CertificateValidationContext{
+											MatchSubjectAltNames: []*v3matcherpb.StringMatcher{
+												{
+													MatchPattern: &v3matcherpb.StringMatcher_Exact{Exact: sanExact},
+													IgnoreCase:   true,
+												},
+												{MatchPattern: &v3matcherpb.StringMatcher_Prefix{Prefix: sanPrefix}},
+												{MatchPattern: &v3matcherpb.StringMatcher_Suffix{Suffix: sanSuffix}},
+												{MatchPattern: &v3matcherpb.StringMatcher_SafeRegex{SafeRegex: &v3matcherpb.RegexMatcher{Regex: sanRegexGood}}},
+												{MatchPattern: &v3matcherpb.StringMatcher_Contains{Contains: sanContains}},
+											},
+											SystemRootCerts: &v3tlspb.CertificateValidationContext_SystemRootCerts{},
+										},
+									},
+								},
+							},
+						}),
+					},
+				},
+			},
+			wantUpdate: ClusterUpdate{
+				ClusterName:    clusterName,
+				EDSServiceName: serviceName,
+				SecurityCfg: &SecurityConfig{
+					UseSystemRootCerts:   true,
+					IdentityInstanceName: identityPluginInstance,
+					IdentityCertName:     identityCertName,
+					SubjectAltNameMatchers: []matcher.StringMatcher{
+						matcher.StringMatcherForTesting(newStringP(sanExact), nil, nil, nil, nil, true),
+						matcher.StringMatcherForTesting(nil, newStringP(sanPrefix), nil, nil, nil, false),
+						matcher.StringMatcherForTesting(nil, nil, newStringP(sanSuffix), nil, nil, false),
+						matcher.StringMatcherForTesting(nil, nil, nil, nil, sanRE, false),
+						matcher.StringMatcherForTesting(nil, nil, nil, newStringP(sanContains), nil, false),
+					},
+				},
+				TelemetryLabels: internal.UnknownCSMLabels,
 			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			update, err := validateClusterAndConstructClusterUpdate(test.cluster)
+			origFlag := envconfig.XDSSystemRootCertsEnabled
+			defer func() {
+				envconfig.XDSSystemRootCertsEnabled = origFlag
+			}()
+			envconfig.XDSSystemRootCertsEnabled = test.enableSystemRootCertsFlag
+			update, err := validateClusterAndConstructClusterUpdate(test.cluster, nil)
 			if (err != nil) != test.wantErr {
 				t.Errorf("validateClusterAndConstructClusterUpdate() returned err %v wantErr %v)", err, test.wantErr)
 			}
-			if diff := cmp.Diff(test.wantUpdate, update, cmpopts.EquateEmpty(), cmp.AllowUnexported(regexp.Regexp{})); diff != "" {
+			if diff := cmp.Diff(test.wantUpdate, update, cmpopts.EquateEmpty(), cmp.AllowUnexported(regexp.Regexp{}), cmpopts.IgnoreFields(ClusterUpdate{}, "LBPolicy")); diff != "" {
 				t.Errorf("validateClusterAndConstructClusterUpdate() returned unexpected diff (-want, +got):\n%s", diff)
 			}
 		})
@@ -1416,7 +1383,7 @@ func (s) TestUnmarshalCluster(t *testing.T) {
 		v3Service     = "v3Service"
 	)
 	var (
-		v3ClusterAny = testutils.MarshalAny(&v3clusterpb.Cluster{
+		v3ClusterAny = testutils.MarshalAny(t, &v3clusterpb.Cluster{
 			Name:                 v3ClusterName,
 			ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
 			EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
@@ -1435,7 +1402,7 @@ func (s) TestUnmarshalCluster(t *testing.T) {
 			},
 		})
 
-		v3ClusterAnyWithEDSConfigSourceSelf = testutils.MarshalAny(&v3clusterpb.Cluster{
+		v3ClusterAnyWithEDSConfigSourceSelf = testutils.MarshalAny(t, &v3clusterpb.Cluster{
 			Name:                 v3ClusterName,
 			ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
 			EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
@@ -1451,11 +1418,82 @@ func (s) TestUnmarshalCluster(t *testing.T) {
 				},
 			},
 		})
+
+		v3ClusterAnyWithTelemetryLabels = testutils.MarshalAny(t, &v3clusterpb.Cluster{
+			Name:                 v3ClusterName,
+			ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+			EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+				EdsConfig: &v3corepb.ConfigSource{
+					ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+						Ads: &v3corepb.AggregatedConfigSource{},
+					},
+				},
+				ServiceName: v3Service,
+			},
+			LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+			LrsServer: &v3corepb.ConfigSource{
+				ConfigSourceSpecifier: &v3corepb.ConfigSource_Self{
+					Self: &v3corepb.SelfConfigSource{},
+				},
+			},
+			Metadata: &v3corepb.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					"com.google.csm.telemetry_labels": {
+						Fields: map[string]*structpb.Value{
+							"service_name":      structpb.NewStringValue("grpc-service"),
+							"service_namespace": structpb.NewStringValue("grpc-service-namespace"),
+						},
+					},
+				},
+			},
+		})
+		v3ClusterAnyWithTelemetryLabelsIgnoreSome = testutils.MarshalAny(t, &v3clusterpb.Cluster{
+			Name:                 v3ClusterName,
+			ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+			EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+				EdsConfig: &v3corepb.ConfigSource{
+					ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+						Ads: &v3corepb.AggregatedConfigSource{},
+					},
+				},
+				ServiceName: v3Service,
+			},
+			LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+			LrsServer: &v3corepb.ConfigSource{
+				ConfigSourceSpecifier: &v3corepb.ConfigSource_Self{
+					Self: &v3corepb.SelfConfigSource{},
+				},
+			},
+			Metadata: &v3corepb.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					"com.google.csm.telemetry_labels": {
+						Fields: map[string]*structpb.Value{
+							"string-value-should-ignore": structpb.NewStringValue("string-val"),
+							"float-value-ignore":         structpb.NewNumberValue(3),
+							"bool-value-ignore":          structpb.NewBoolValue(false),
+							"service_name":               structpb.NewStringValue("grpc-service"), // shouldn't ignore
+							"service_namespace":          structpb.NewNullValue(),                 // should ignore - wrong type
+						},
+					},
+					"ignore-this-metadata": { // should ignore this filter_metadata
+						Fields: map[string]*structpb.Value{
+							"service_namespace": structpb.NewStringValue("string-val-should-ignore"),
+						},
+					},
+				},
+			},
+		})
 	)
+
+	serverCfg, err := bootstrap.ServerConfigForTesting(bootstrap.ServerConfigTestingOptions{URI: "test-server"})
+	if err != nil {
+		t.Fatalf("Failed to create server config for testing: %v", err)
+	}
 
 	tests := []struct {
 		name       string
 		resource   *anypb.Any
+		serverCfg  *bootstrap.ServerConfig
 		wantName   string
 		wantUpdate ClusterUpdate
 		wantErr    bool
@@ -1475,7 +1513,7 @@ func (s) TestUnmarshalCluster(t *testing.T) {
 		},
 		{
 			name: "bad cluster resource",
-			resource: testutils.MarshalAny(&v3clusterpb.Cluster{
+			resource: testutils.MarshalAny(t, &v3clusterpb.Cluster{
 				Name:                 "test",
 				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_STATIC},
 			}),
@@ -1484,7 +1522,7 @@ func (s) TestUnmarshalCluster(t *testing.T) {
 		},
 		{
 			name: "cluster resource with non-self lrs_server field",
-			resource: testutils.MarshalAny(&v3clusterpb.Cluster{
+			resource: testutils.MarshalAny(t, &v3clusterpb.Cluster{
 				Name:                 "test",
 				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
 				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
@@ -1506,46 +1544,104 @@ func (s) TestUnmarshalCluster(t *testing.T) {
 			wantErr:  true,
 		},
 		{
-			name:     "v3 cluster",
-			resource: v3ClusterAny,
-			wantName: v3ClusterName,
+			name:      "v3 cluster",
+			resource:  v3ClusterAny,
+			serverCfg: serverCfg,
+			wantName:  v3ClusterName,
 			wantUpdate: ClusterUpdate{
-				ClusterName:    v3ClusterName,
-				EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
-				Raw: v3ClusterAny,
+				ClusterName:     v3ClusterName,
+				EDSServiceName:  v3Service,
+				LRSServerConfig: serverCfg,
+				Raw:             v3ClusterAny,
+				TelemetryLabels: internal.UnknownCSMLabels,
 			},
 		},
 		{
-			name:     "v3 cluster wrapped",
-			resource: testutils.MarshalAny(&v3discoverypb.Resource{Resource: v3ClusterAny}),
-			wantName: v3ClusterName,
+			name:      "v3 cluster wrapped",
+			resource:  testutils.MarshalAny(t, &v3discoverypb.Resource{Resource: v3ClusterAny}),
+			serverCfg: serverCfg,
+			wantName:  v3ClusterName,
 			wantUpdate: ClusterUpdate{
-				ClusterName:    v3ClusterName,
-				EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
-				Raw: v3ClusterAny,
+				ClusterName:     v3ClusterName,
+				EDSServiceName:  v3Service,
+				LRSServerConfig: serverCfg,
+				Raw:             v3ClusterAny,
+				TelemetryLabels: internal.UnknownCSMLabels,
 			},
 		},
 		{
-			name:     "v3 cluster with EDS config source self",
-			resource: v3ClusterAnyWithEDSConfigSourceSelf,
-			wantName: v3ClusterName,
+			name:      "v3 cluster with EDS config source self",
+			resource:  v3ClusterAnyWithEDSConfigSourceSelf,
+			serverCfg: serverCfg,
+			wantName:  v3ClusterName,
 			wantUpdate: ClusterUpdate{
-				ClusterName:    v3ClusterName,
-				EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
-				Raw: v3ClusterAnyWithEDSConfigSourceSelf,
+				ClusterName:     v3ClusterName,
+				EDSServiceName:  v3Service,
+				LRSServerConfig: serverCfg,
+				Raw:             v3ClusterAnyWithEDSConfigSourceSelf,
+				TelemetryLabels: internal.UnknownCSMLabels,
 			},
+		},
+		{
+			name:      "v3 cluster with telemetry case",
+			resource:  v3ClusterAnyWithTelemetryLabels,
+			serverCfg: serverCfg,
+			wantName:  v3ClusterName,
+			wantUpdate: ClusterUpdate{
+				ClusterName:     v3ClusterName,
+				EDSServiceName:  v3Service,
+				LRSServerConfig: serverCfg,
+				Raw:             v3ClusterAnyWithTelemetryLabels,
+				TelemetryLabels: map[string]string{
+					"csm.service_name":           "grpc-service",
+					"csm.service_namespace_name": "grpc-service-namespace",
+				},
+			},
+		},
+		{
+			name:      "v3 metadata ignore other types not string and not com.google.csm.telemetry_labels",
+			resource:  v3ClusterAnyWithTelemetryLabelsIgnoreSome,
+			serverCfg: serverCfg,
+			wantName:  v3ClusterName,
+			wantUpdate: ClusterUpdate{
+				ClusterName:     v3ClusterName,
+				EDSServiceName:  v3Service,
+				LRSServerConfig: serverCfg,
+				Raw:             v3ClusterAnyWithTelemetryLabelsIgnoreSome,
+				TelemetryLabels: map[string]string{
+					"csm.service_name":           "grpc-service",
+					"csm.service_namespace_name": "unknown",
+				},
+			},
+		},
+		{
+			name: "xdstp cluster resource with unset EDS service name",
+			resource: testutils.MarshalAny(t, &v3clusterpb.Cluster{
+				Name:                 "xdstp:foo",
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: "",
+				},
+			}),
+			wantName: "xdstp:foo",
+			wantErr:  true,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			name, update, err := unmarshalClusterResource(test.resource)
+			name, update, err := unmarshalClusterResource(test.resource, test.serverCfg)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("unmarshalClusterResource(%s), got err: %v, wantErr: %v", pretty.ToJSON(test.resource), err, test.wantErr)
 			}
 			if name != test.wantName {
 				t.Errorf("unmarshalClusterResource(%s), got name: %s, want: %s", pretty.ToJSON(test.resource), name, test.wantName)
 			}
-			if diff := cmp.Diff(update, test.wantUpdate, cmpOpts); diff != "" {
+			if diff := cmp.Diff(update, test.wantUpdate, cmpOpts, cmpopts.IgnoreFields(ClusterUpdate{}, "LBPolicy")); diff != "" {
 				t.Errorf("unmarshalClusterResource(%s), got unexpected update, diff (-got +want): %v", pretty.ToJSON(test.resource), diff)
 			}
 		})
@@ -1570,43 +1666,55 @@ func (s) TestValidateClusterWithOutlierDetection(t *testing.T) {
 			OutlierDetection: od,
 		}
 	}
-	odToClusterUpdate := func(od *OutlierDetection) ClusterUpdate {
-		return ClusterUpdate{
-			ClusterName:      clusterName,
-			LRSServerConfig:  ClusterLRSOff,
-			OutlierDetection: od,
-		}
-	}
 
 	tests := []struct {
-		name       string
-		cluster    *v3clusterpb.Cluster
-		wantUpdate ClusterUpdate
-		wantErr    bool
+		name      string
+		cluster   *v3clusterpb.Cluster
+		wantODCfg string
+		wantErr   bool
 	}{
 		{
-			name: "successful-case-all-defaults",
-			// Outlier detection proto is present without any fields specified,
-			// so should trigger all default values in the update.
-			cluster: odToClusterProto(&v3clusterpb.OutlierDetection{}),
-			wantUpdate: odToClusterUpdate(&OutlierDetection{
-				Interval:                       10 * time.Second,
-				BaseEjectionTime:               30 * time.Second,
-				MaxEjectionTime:                300 * time.Second,
-				MaxEjectionPercent:             10,
-				SuccessRateStdevFactor:         1900,
-				EnforcingSuccessRate:           100,
-				SuccessRateMinimumHosts:        5,
-				SuccessRateRequestVolume:       100,
-				FailurePercentageThreshold:     85,
-				EnforcingFailurePercentage:     0,
-				FailurePercentageMinimumHosts:  5,
-				FailurePercentageRequestVolume: 50,
-			}),
+			name:      "success-and-failure-null",
+			cluster:   odToClusterProto(&v3clusterpb.OutlierDetection{}),
+			wantODCfg: `{"successRateEjection": {}}`,
 		},
 		{
-			name: "successful-case-all-fields-configured-and-valid",
+			name: "success-and-failure-zero",
 			cluster: odToClusterProto(&v3clusterpb.OutlierDetection{
+				EnforcingSuccessRate:       &wrapperspb.UInt32Value{Value: 0}, // Thus doesn't create sre - to focus on fpe
+				EnforcingFailurePercentage: &wrapperspb.UInt32Value{Value: 0},
+			}),
+			wantODCfg: `{}`,
+		},
+		{
+			name: "some-fields-set",
+			cluster: odToClusterProto(&v3clusterpb.OutlierDetection{
+				Interval:                       &durationpb.Duration{Seconds: 1},
+				MaxEjectionTime:                &durationpb.Duration{Seconds: 3},
+				EnforcingSuccessRate:           &wrapperspb.UInt32Value{Value: 3},
+				SuccessRateRequestVolume:       &wrapperspb.UInt32Value{Value: 5},
+				EnforcingFailurePercentage:     &wrapperspb.UInt32Value{Value: 7},
+				FailurePercentageRequestVolume: &wrapperspb.UInt32Value{Value: 9},
+			}),
+			wantODCfg: `{
+				"interval": "1s",
+				"maxEjectionTime": "3s",
+				"successRateEjection": {
+					"enforcementPercentage": 3,
+					"requestVolume": 5
+				},
+				"failurePercentageEjection": {
+					"enforcementPercentage": 7,
+					"requestVolume": 9
+				}
+			}`,
+		},
+		{
+			name: "every-field-set-non-zero",
+			cluster: odToClusterProto(&v3clusterpb.OutlierDetection{
+				// all fields set (including ones that will be layered) should
+				// pick up those too and explicitly all fields, including those
+				// put in layers, in the JSON generated.
 				Interval:                       &durationpb.Duration{Seconds: 1},
 				BaseEjectionTime:               &durationpb.Duration{Seconds: 2},
 				MaxEjectionTime:                &durationpb.Duration{Seconds: 3},
@@ -1620,20 +1728,24 @@ func (s) TestValidateClusterWithOutlierDetection(t *testing.T) {
 				FailurePercentageMinimumHosts:  &wrapperspb.UInt32Value{Value: 8},
 				FailurePercentageRequestVolume: &wrapperspb.UInt32Value{Value: 9},
 			}),
-			wantUpdate: odToClusterUpdate(&OutlierDetection{
-				Interval:                       time.Second,
-				BaseEjectionTime:               time.Second * 2,
-				MaxEjectionTime:                time.Second * 3,
-				MaxEjectionPercent:             1,
-				SuccessRateStdevFactor:         2,
-				EnforcingSuccessRate:           3,
-				SuccessRateMinimumHosts:        4,
-				SuccessRateRequestVolume:       5,
-				FailurePercentageThreshold:     6,
-				EnforcingFailurePercentage:     7,
-				FailurePercentageMinimumHosts:  8,
-				FailurePercentageRequestVolume: 9,
-			}),
+			wantODCfg: `{
+				"interval": "1s",
+				"baseEjectionTime": "2s",
+				"maxEjectionTime": "3s",
+				"maxEjectionPercent": 1,
+				"successRateEjection": {
+					"stdevFactor": 2,
+					"enforcementPercentage": 3,
+					"minimumHosts": 4,
+					"requestVolume": 5
+				},
+				"failurePercentageEjection": {
+					"threshold": 6,
+					"enforcementPercentage": 7,
+					"minimumHosts": 8,
+					"requestVolume": 9
+				}
+			}`,
 		},
 		{
 			name:    "interval-is-negative",
@@ -1691,12 +1803,25 @@ func (s) TestValidateClusterWithOutlierDetection(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			update, err := validateClusterAndConstructClusterUpdate(test.cluster)
+			update, err := validateClusterAndConstructClusterUpdate(test.cluster, nil)
 			if (err != nil) != test.wantErr {
 				t.Errorf("validateClusterAndConstructClusterUpdate() returned err %v wantErr %v)", err, test.wantErr)
 			}
-			if diff := cmp.Diff(test.wantUpdate, update, cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("validateClusterAndConstructClusterUpdate() returned unexpected diff (-want, +got):\n%s", diff)
+			if test.wantErr {
+				return
+			}
+			// got and want must be unmarshalled since JSON strings shouldn't
+			// generally be directly compared.
+			var got map[string]any
+			if err := json.Unmarshal(update.OutlierDetection, &got); err != nil {
+				t.Fatalf("Error unmarshalling update.OutlierDetection (%q): %v", update.OutlierDetection, err)
+			}
+			var want map[string]any
+			if err := json.Unmarshal(json.RawMessage(test.wantODCfg), &want); err != nil {
+				t.Fatalf("Error unmarshalling wantODCfg (%q): %v", test.wantODCfg, err)
+			}
+			if diff := cmp.Diff(got, want); diff != "" {
+				t.Fatalf("cluster.OutlierDetection got unexpected output, diff (-got, +want): %v", diff)
 			}
 		})
 	}

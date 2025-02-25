@@ -31,11 +31,11 @@ import (
 	"google.golang.org/grpc/internal/serviceconfig"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/internal/testutils"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
-	testpb "google.golang.org/grpc/test/grpc_testing"
 )
 
 type funcConfigSelector struct {
@@ -50,7 +50,7 @@ func (s) TestConfigSelector(t *testing.T) {
 	gotContextChan := testutils.NewChannelWithSize(1)
 
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
 			gotContextChan.SendContext(ctx, ctx)
 			return &testpb.Empty{}, nil
 		},
@@ -62,12 +62,14 @@ func (s) TestConfigSelector(t *testing.T) {
 	}
 	defer ss.Stop()
 
-	ctxDeadline := time.Now().Add(10 * time.Second)
-	ctx, cancel := context.WithDeadline(context.Background(), ctxDeadline)
+	const normalTimeout = 10 * time.Second
+	ctxDeadline := time.Now().Add(normalTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), normalTimeout)
 	defer cancel()
 
-	longCtxDeadline := time.Now().Add(30 * time.Second)
-	longdeadlineCtx, cancel := context.WithDeadline(context.Background(), longCtxDeadline)
+	const longTimeout = 30 * time.Second
+	longCtxDeadline := time.Now().Add(longTimeout)
+	longdeadlineCtx, cancel := context.WithTimeout(context.Background(), longTimeout)
 	defer cancel()
 	shorterTimeout := 3 * time.Second
 
@@ -198,7 +200,7 @@ func (s) TestConfigSelector(t *testing.T) {
 			}
 
 			wantDeadline := tc.wantDeadline
-			if wantDeadline == (time.Time{}) {
+			if wantDeadline.Equal(time.Time{}) {
 				wantDeadline = startTime.Add(tc.wantTimeout)
 			}
 			deadlineGot, _ := gotContext.Deadline()

@@ -28,19 +28,35 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer/weightedroundrobin"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal"
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/serviceconfig"
-	testpb "google.golang.org/grpc/test/grpc_testing"
+
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
+
 	_ "google.golang.org/grpc/xds/internal/balancer/outlierdetection" // To register helper functions which register/unregister Outlier Detection LB Policy.
 )
 
-var defaultTestTimeout = 5 * time.Second
+var (
+	defaultTestTimeout = 5 * time.Second
+	leafPolicyName     = "round_robin"
+)
+
+func init() {
+	// Test the health listener code path for ejection when the experimental
+	// pickfirst is enabled.
+	if envconfig.NewPickFirstEnabled {
+		leafPolicyName = weightedroundrobin.Name
+	}
+}
 
 type s struct {
 	grpctest.Tester
@@ -99,12 +115,14 @@ func setupBackends(t *testing.T) ([]string, func()) {
 //
 // Returns a non-nil error if context deadline expires before RPCs start to get
 // roundrobined across the given backends.
-func checkRoundRobinRPCs(ctx context.Context, client testpb.TestServiceClient, addrs []resolver.Address) error {
+func checkRoundRobinRPCs(ctx context.Context, client testgrpc.TestServiceClient, addrs []resolver.Address) error {
 	wantAddrCount := make(map[string]int)
 	for _, addr := range addrs {
 		wantAddrCount[addr.Addr]++
 	}
+	gotAddrCount := make(map[string]int)
 	for ; ctx.Err() == nil; <-time.After(time.Millisecond) {
+		gotAddrCount = make(map[string]int)
 		// Perform 3 iterations.
 		var iterations [][]string
 		for i := 0; i < 3; i++ {
@@ -118,8 +136,7 @@ func checkRoundRobinRPCs(ctx context.Context, client testpb.TestServiceClient, a
 			}
 			iterations = append(iterations, iteration)
 		}
-		// Ensure the the first iteration contains all addresses in addrs.
-		gotAddrCount := make(map[string]int)
+		// Ensure the first iteration contains all addresses in addrs.
 		for _, addr := range iterations[0] {
 			gotAddrCount[addr]++
 		}
@@ -132,7 +149,7 @@ func checkRoundRobinRPCs(ctx context.Context, client testpb.TestServiceClient, a
 		}
 		return nil
 	}
-	return fmt.Errorf("timeout when waiting for roundrobin distribution of RPCs across addresses: %v", addrs)
+	return fmt.Errorf("timeout when waiting for roundrobin distribution of RPCs across addresses: %v; got: %v", addrs, gotAddrCount)
 }
 
 // TestOutlierDetectionAlgorithmsE2E tests the Outlier Detection Success Rate
@@ -151,50 +168,50 @@ func (s) TestOutlierDetectionAlgorithmsE2E(t *testing.T) {
 	}{
 		{
 			name: "Success Rate Algorithm",
-			odscJSON: `
-{
-  "loadBalancingConfig": [
-    {
-      "outlier_detection_experimental": {
-        "interval": 50000000,
-		"baseEjectionTime": 100000000,
-		"maxEjectionTime": 300000000000,
-		"maxEjectionPercent": 33,
-		"successRateEjection": {
-			"stdevFactor": 50,
-			"enforcementPercentage": 100,
-			"minimumHosts": 3,
-			"requestVolume": 5
-		},
-        "childPolicy": [{"round_robin": {}}]
-      }
-    }
-  ]
-}`,
+			odscJSON: fmt.Sprintf(`
+			{
+			  "loadBalancingConfig": [
+				{
+				  "outlier_detection_experimental": {
+					"interval": "0.050s",
+					"baseEjectionTime": "0.100s",
+					"maxEjectionTime": "300s",
+					"maxEjectionPercent": 33,
+					"successRateEjection": {
+						"stdevFactor": 50,
+						"enforcementPercentage": 100,
+						"minimumHosts": 3,
+						"requestVolume": 5
+					},
+					"childPolicy": [{"%s": {}}]
+				  }
+				}
+			  ]
+			}`, leafPolicyName),
 		},
 		{
 			name: "Failure Percentage Algorithm",
-			odscJSON: `
-{
-  "loadBalancingConfig": [
-    {
-      "outlier_detection_experimental": {
-        "interval": 50000000,
-		"baseEjectionTime": 100000000,
-		"maxEjectionTime": 300000000000,
-		"maxEjectionPercent": 33,
-		"failurePercentageEjection": {
-			"threshold": 50,
-			"enforcementPercentage": 100,
-			"minimumHosts": 3,
-			"requestVolume": 5
-		},
-        "childPolicy": [{"round_robin": {}}
-		]
-      }
-    }
-  ]
-}`,
+			odscJSON: fmt.Sprintf(`
+			{
+			  "loadBalancingConfig": [
+				{
+				  "outlier_detection_experimental": {
+					"interval": "0.050s",
+					"baseEjectionTime": "0.100s",
+					"maxEjectionTime": "300s",
+					"maxEjectionPercent": 33,
+					"failurePercentageEjection": {
+						"threshold": 50,
+						"enforcementPercentage": 100,
+						"minimumHosts": 3,
+						"requestVolume": 5
+					},
+					"childPolicy": [{"%s": {}}
+					]
+				  }
+				}
+			  ]
+			}`, leafPolicyName),
 		},
 	}
 	for _, test := range tests {
@@ -217,14 +234,14 @@ func (s) TestOutlierDetectionAlgorithmsE2E(t *testing.T) {
 				ServiceConfig: sc,
 			})
 
-			cc, err := grpc.Dial(mr.Scheme()+":///", grpc.WithResolvers(mr), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			cc, err := grpc.NewClient(mr.Scheme()+":///", grpc.WithResolvers(mr), grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
-				t.Fatalf("grpc.Dial() failed: %v", err)
+				t.Fatalf("grpc.NewClient() failed: %v", err)
 			}
 			defer cc.Close()
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 			defer cancel()
-			testServiceClient := testpb.NewTestServiceClient(cc)
+			testServiceClient := testgrpc.NewTestServiceClient(cc)
 
 			// At first, due to no statistics on each of the backends, the 3
 			// upstreams should all be round robined across.
@@ -269,20 +286,20 @@ func (s) TestNoopConfiguration(t *testing.T) {
 	mr := manual.NewBuilderWithScheme("od-e2e")
 	defer mr.Close()
 
-	noopODServiceConfigJSON := `
-{
-  "loadBalancingConfig": [
-    {
-      "outlier_detection_experimental": {
-        "interval": 50000000,
-		"baseEjectionTime": 100000000,
-		"maxEjectionTime": 300000000000,
-		"maxEjectionPercent": 33,
-        "childPolicy": [{"round_robin": {}}]
-      }
-    }
-  ]
-}`
+	noopODServiceConfigJSON := fmt.Sprintf(`
+	{
+	  "loadBalancingConfig": [
+		{
+		  "outlier_detection_experimental": {
+			"interval": "0.050s",
+			"baseEjectionTime": "0.100s",
+			"maxEjectionTime": "300s",
+			"maxEjectionPercent": 33,
+			"childPolicy": [{"%s": {}}]
+		  }
+		}
+	  ]
+	}`, leafPolicyName)
 	sc := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(noopODServiceConfigJSON)
 	// The full list of addresses.
 	fullAddresses := []resolver.Address{
@@ -294,14 +311,14 @@ func (s) TestNoopConfiguration(t *testing.T) {
 		Addresses:     fullAddresses,
 		ServiceConfig: sc,
 	})
-	cc, err := grpc.Dial(mr.Scheme()+":///", grpc.WithResolvers(mr), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(mr.Scheme()+":///", grpc.WithResolvers(mr), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	testServiceClient := testpb.NewTestServiceClient(cc)
+	testServiceClient := testgrpc.NewTestServiceClient(cc)
 
 	for i := 0; i < 2; i++ {
 		// Since the Outlier Detection Balancer starts with a noop
@@ -317,26 +334,26 @@ func (s) TestNoopConfiguration(t *testing.T) {
 	// specifies to count RPC's and eject upstreams. Due to the balancer no
 	// longer being a noop, it should eject any unhealthy addresses as specified
 	// by the failure percentage portion of the configuration.
-	countingODServiceConfigJSON := `
-{
-  "loadBalancingConfig": [
-    {
-      "outlier_detection_experimental": {
-        "interval": 50000000,
-		"baseEjectionTime": 100000000,
-		"maxEjectionTime": 300000000000,
-		"maxEjectionPercent": 33,
-		"failurePercentageEjection": {
-			"threshold": 50,
-			"enforcementPercentage": 100,
-			"minimumHosts": 3,
-			"requestVolume": 5
-		},
-        "childPolicy": [{"round_robin": {}}]
-      }
-    }
-  ]
-}`
+	countingODServiceConfigJSON := fmt.Sprintf(`
+	{
+	  "loadBalancingConfig": [
+		{
+		  "outlier_detection_experimental": {
+			"interval": "0.050s",
+			"baseEjectionTime": "0.100s",
+			"maxEjectionTime": "300s",
+			"maxEjectionPercent": 33,
+			"failurePercentageEjection": {
+				"threshold": 50,
+				"enforcementPercentage": 100,
+				"minimumHosts": 3,
+				"requestVolume": 5
+			},
+			"childPolicy": [{"%s": {}}]
+		  }
+		}
+	  ]
+	}`, leafPolicyName)
 	sc = internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(countingODServiceConfigJSON)
 
 	mr.UpdateState(resolver.State{

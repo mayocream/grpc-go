@@ -28,7 +28,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/status"
-	testpb "google.golang.org/grpc/test/grpc_testing"
+
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 )
 
 func (s) TestHTTPHeaderFrameErrorHandlingHTTPMode(t *testing.T) {
@@ -241,14 +242,14 @@ func startServer(t *testing.T, headerFields ...[]string) (serverAddr string, cle
 }
 
 func doHTTPHeaderTest(lisAddr string, errCode codes.Code) error {
-	cc, err := grpc.Dial(lisAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(lisAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return fmt.Errorf("dial(%q): %v", lisAddr, err)
+		return fmt.Errorf("NewClient(%q): %v", lisAddr, err)
 	}
 	defer cc.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	client := testpb.NewTestServiceClient(cc)
+	client := testgrpc.NewTestServiceClient(cc)
 	stream, err := client.FullDuplexCall(ctx)
 	if err != nil {
 		return fmt.Errorf("creating FullDuplex stream: %v", err)

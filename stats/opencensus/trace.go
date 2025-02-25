@@ -24,6 +24,7 @@ import (
 	"go.opencensus.io/trace"
 	"go.opencensus.io/trace/propagation"
 
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
@@ -39,11 +40,14 @@ type traceInfo struct {
 // about this span into gRPC Metadata.
 func (csh *clientStatsHandler) traceTagRPC(ctx context.Context, rti *stats.RPCTagInfo) (context.Context, *traceInfo) {
 	// TODO: get consensus on whether this method name of "s.m" is correct.
-	mn := "Attempt." + strings.Replace(removeLeadingSlash(rti.FullMethodName), "/", ".", -1)
-	_, span := trace.StartSpan(ctx, mn, trace.WithSampler(csh.to.TS), trace.WithSpanKind(trace.SpanKindClient))
+	mn := "Attempt." + strings.ReplaceAll(removeLeadingSlash(rti.FullMethodName), "/", ".")
+	// Returned context is ignored because will populate context with data that
+	// wraps the span instead. Don't set span kind client on this attempt span
+	// to prevent backend from prepending span name with "Sent.".
+	_, span := trace.StartSpan(ctx, mn, trace.WithSampler(csh.to.TS))
 
 	tcBin := propagation.Binary(span.SpanContext())
-	return stats.SetTrace(ctx, tcBin), &traceInfo{
+	return metadata.AppendToOutgoingContext(ctx, "grpc-trace-bin", string(tcBin)), &traceInfo{
 		span:         span,
 		countSentMsg: 0, // msg events scoped to scope of context, per attempt client side
 		countRecvMsg: 0,
@@ -52,12 +56,17 @@ func (csh *clientStatsHandler) traceTagRPC(ctx context.Context, rti *stats.RPCTa
 
 // traceTagRPC populates context with new span data, with a parent based on the
 // spanContext deserialized from context passed in (wire data in gRPC metadata)
-// if present.
+// if present. If multiple spanContexts exist, it takes the last one.
 func (ssh *serverStatsHandler) traceTagRPC(ctx context.Context, rti *stats.RPCTagInfo) (context.Context, *traceInfo) {
-	mn := strings.Replace(removeLeadingSlash(rti.FullMethodName), "/", ".", -1)
+	mn := strings.ReplaceAll(removeLeadingSlash(rti.FullMethodName), "/", ".")
+
+	var tcBin []byte
+	if tcValues := metadata.ValueFromIncomingContext(ctx, "grpc-trace-bin"); len(tcValues) > 0 {
+		tcBin = []byte(tcValues[len(tcValues)-1])
+	}
 
 	var span *trace.Span
-	if sc, ok := propagation.FromBinary(stats.Trace(ctx)); ok {
+	if sc, ok := propagation.FromBinary(tcBin); ok {
 		// Returned context is ignored because will populate context with data
 		// that wraps the span instead.
 		_, span = trace.StartSpanWithRemoteParent(ctx, mn, sc, trace.WithSpanKind(trace.SpanKindServer), trace.WithSampler(ssh.to.TS))
@@ -78,7 +87,7 @@ func (ssh *serverStatsHandler) traceTagRPC(ctx context.Context, rti *stats.RPCTa
 // populateSpan populates span information based on stats passed in (invariants
 // of the RPC lifecycle), and also ends span which triggers the span to be
 // exported.
-func populateSpan(ctx context.Context, rs stats.RPCStats, ti *traceInfo) {
+func populateSpan(_ context.Context, rs stats.RPCStats, ti *traceInfo) {
 	if ti == nil || ti.span == nil {
 		// Shouldn't happen, tagRPC call comes before this function gets called
 		// which populates this information.
@@ -96,14 +105,16 @@ func populateSpan(ctx context.Context, rs stats.RPCStats, ti *traceInfo) {
 			trace.BoolAttribute("Client", rs.Client),
 			trace.BoolAttribute("FailFast", rs.FailFast),
 		)
+	case *stats.PickerUpdated:
+		span.Annotate(nil, "Delayed LB pick complete")
 	case *stats.InPayload:
 		// message id - "must be calculated as two different counters starting
-		// from 1 one for sent messages and one for received messages."
+		// from one for sent messages and one for received messages."
 		mi := atomic.AddUint32(&ti.countRecvMsg, 1)
-		span.AddMessageReceiveEvent(int64(mi), int64(rs.Length), int64(rs.WireLength))
+		span.AddMessageReceiveEvent(int64(mi), int64(rs.Length), int64(rs.CompressedLength))
 	case *stats.OutPayload:
 		mi := atomic.AddUint32(&ti.countSentMsg, 1)
-		span.AddMessageSendEvent(int64(mi), int64(rs.Length), int64(rs.WireLength))
+		span.AddMessageSendEvent(int64(mi), int64(rs.Length), int64(rs.CompressedLength))
 	case *stats.End:
 		if rs.Error != nil {
 			// "The mapping between gRPC canonical codes and OpenCensus codes
