@@ -132,6 +132,10 @@ type http2Server struct {
 	maxStreamID uint32 // max stream ID ever seen
 
 	logger *grpclog.PrefixLogger
+	// setResetPingStrikes is stored as a closure instead of making this a
+	// method on http2Server to avoid a heap allocation when converting a method
+	// to a closure for passing to frames objects.
+	setResetPingStrikes func()
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -265,6 +269,9 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		kep:               kep,
 		initialWindowSize: iwz,
 		bufferPool:        config.BufferPool,
+	}
+	t.setResetPingStrikes = func() {
+		atomic.StoreUint32(&t.resetPingStrikes, 1)
 	}
 	var czSecurity credentials.ChannelzSecurityValue
 	if au, ok := authInfo.(credentials.ChannelzSecurityInfo); ok {
@@ -1016,10 +1023,6 @@ func (t *http2Server) writeHeader(s *ServerStream, md metadata.MD) error {
 	return nil
 }
 
-func (t *http2Server) setResetPingStrikes() {
-	atomic.StoreUint32(&t.resetPingStrikes, 1)
-}
-
 func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
@@ -1132,17 +1135,13 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 // Write converts the data into HTTP2 data frame and sends it out. Non-nil error
 // is returns if it fails (e.g., framing error, transport error).
 func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
-	reader := data.Reader()
-
 	if !s.isHeaderSent() { // Headers haven't been written yet.
 		if err := t.writeHeader(s, nil); err != nil {
-			_ = reader.Close()
 			return err
 		}
 	} else {
 		// Writing headers checks for this condition.
 		if s.getState() == streamDone {
-			_ = reader.Close()
 			return t.streamContextErr(s)
 		}
 	}
@@ -1150,15 +1149,16 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 	df := &dataFrame{
 		streamID:    s.id,
 		h:           hdr,
-		reader:      reader,
+		data:        data,
 		onEachWrite: t.setResetPingStrikes,
 	}
-	if err := s.wq.get(int32(len(hdr) + df.reader.Remaining())); err != nil {
-		_ = reader.Close()
+	dataLen := data.Len()
+	if err := s.wq.get(int32(len(hdr) + dataLen)); err != nil {
 		return t.streamContextErr(s)
 	}
+	data.Ref()
 	if err := t.controlBuf.put(df); err != nil {
-		_ = reader.Close()
+		data.Free()
 		return err
 	}
 	t.incrMsgSent()
