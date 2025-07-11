@@ -3740,6 +3740,39 @@ func (s) TestClientStreaming_ReturnErrorAfterSendAndClose(t *testing.T) {
 	}
 }
 
+// Tests that a client receives a cardinality violation error for client-streaming
+// RPCs if the server call SendMsg multiple times.
+func (s) TestClientStreaming_ServerHandlerSendMsgAfterSendMsg(t *testing.T) {
+	ss := stubserver.StubServer{
+		StreamingInputCallF: func(stream testgrpc.TestService_StreamingInputCallServer) error {
+			if err := stream.SendMsg(&testpb.StreamingInputCallResponse{}); err != nil {
+				t.Errorf("stream.SendMsg(_) = %v, want <nil>", err)
+			}
+			if err := stream.SendMsg(&testpb.StreamingInputCallResponse{}); err != nil {
+				t.Errorf("stream.SendMsg(_) = %v, want <nil>", err)
+			}
+			return nil
+		},
+	}
+	if err := ss.Start(nil); err != nil {
+		t.Fatal("Error starting server:", err)
+	}
+	defer ss.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	stream, err := ss.Client.StreamingInputCall(ctx)
+	if err != nil {
+		t.Fatalf(".StreamingInputCall(_) = _, %v, want <nil>", err)
+	}
+	if err := stream.Send(&testpb.StreamingInputCallRequest{}); err != nil {
+		t.Fatalf("stream.Send(_) = %v, want <nil>", err)
+	}
+	if _, err := stream.CloseAndRecv(); status.Code(err) != codes.Internal {
+		t.Fatalf("stream.CloseAndRecv() = %v, want error with status code %s", err, codes.Internal)
+	}
+}
+
 func (s) TestExceedMaxStreamsLimit(t *testing.T) {
 	for _, e := range listTestEnv() {
 		testExceedMaxStreamsLimit(t, e)
@@ -5279,7 +5312,7 @@ func (s) TestStatusInvalidUTF8Message(t *testing.T) {
 // will fail to marshal the status because of the invalid utf8 message. Details
 // will be dropped when sending.
 func (s) TestStatusInvalidUTF8Details(t *testing.T) {
-	grpctest.TLogger.ExpectError("Failed to marshal rpc status")
+	grpctest.ExpectError("Failed to marshal rpc status")
 
 	var (
 		origMsg = string([]byte{0xff, 0xfe, 0xfd})
@@ -6290,7 +6323,7 @@ func (s) TestServerClosesConn(t *testing.T) {
 // TestNilStatsHandler ensures we do not panic as a result of a nil stats
 // handler.
 func (s) TestNilStatsHandler(t *testing.T) {
-	grpctest.TLogger.ExpectErrorN("ignoring nil parameter", 2)
+	grpctest.ExpectErrorN("ignoring nil parameter", 2)
 	ss := &stubserver.StubServer{
 		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			return &testpb.SimpleResponse{}, nil
